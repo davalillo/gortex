@@ -39,6 +39,7 @@ The core registry (`internal/semantic/lsp/registry.go`):
 | `elixir-ls`                  | `elixir-ls`                      | elixir                      | 5                |
 | `ocamllsp`                   | `ocamllsp`                       | ocaml                       | 5                |
 | `zls`                        | `zls`                            | zig                         | 5                |
+| `mql-lsp-server`             | `mql-lsp-server`                 | mql                         | 5                |
 
 Several specs declare `AlternativeCommands` — Gortex picks the first
 binary on `PATH`:
@@ -148,6 +149,13 @@ opam install ocaml-lsp-server
 
 # Zig
 brew install zls
+
+# MQL4/MQL5 (pick one)
+# Standalone binary from GitHub Releases (no .NET runtime needed, recommended):
+wget https://github.com/davalillo/mql-language-server/releases/latest/download/mql-lsp-server-linux-x64
+chmod +x mql-lsp-server-linux-x64 && sudo mv mql-lsp-server-linux-x64 /usr/local/bin/mql-lsp-server
+# or as a .NET global tool (requires .NET 10):
+dotnet tool install -g mql-language-server
 ```
 
 Verify with `gortex daemon status` — the `lsp` row reports `alive`
