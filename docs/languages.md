@@ -194,12 +194,15 @@ What is **not** covered:
 ### MQL specifics
 
 MQL4 and MQL5 (`.mq4`/`.mq5`/`.mqh`) index through one bespoke extractor over
-the `davalillo/tree-sitter-mql5` fork — tree-sitter-cpp plus the MQL5 `input`
-storage class, `sinput`, an `interface_specifier` rule, and the MQL-native
-`C'255,0,0'` / `D'2024.01.01'` literals. A C-only scanner stub replaces the
-upstream C++ raw-string scanner, which MQL5 never uses. Modern MQL4 (build
-600+) shares MQL5 syntax and pre-600 legacy sources are a C subset, so one
-grammar serves all three extensions.
+`davalillo/tree-sitter-mql5` — independently maintained since 2026 (it began
+as a fork of the dormant `mskelton/tree-sitter-mql5`; full git history and
+per-contribution attribution preserved). The grammar is tree-sitter-cpp
+v0.23.4 plus the MQL5 `input` storage class, `sinput`, an
+`interface_specifier` rule, and the MQL-native `C'255,0,0'` / `D'2024.01.01'`
+literals. Its external scanner is the C-only scanner of the cpp base
+(renamed `tree_sitter_mql5_*`): the build needs no C++ toolchain. Modern MQL4
+(build 600+) shares MQL5 syntax and pre-600 legacy sources are a C subset, so
+one grammar serves all three extensions.
 
 - The file node carries `Meta["dialect"]` (`mql4`/`mql5`; `.mqh` is
   content-sniffed with the same MQL5 markers mql-language-server uses,
