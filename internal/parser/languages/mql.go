@@ -72,6 +72,13 @@ const qMqlAll = `
 // files — the same marker list mql-language-server's LanguageDetection uses
 // (`using` and `final` deliberately excluded: valid in MQL4 too). A .mqh
 // using none of them falls back to mql4, the server's documented default.
+//
+// Shared contract: this list must mirror
+// mql-language-server src/Lsp/Server/LanguageDetection.cs (Mql5Tokens —
+// the server's single source of truth). Last verified identical against
+// v2.4.2 (nullptr, #resource, union, "pack(", "enum class"). If the server
+// changes its list, update both sides in the same change and re-verify the
+// dialect tests below.
 var mql5Markers = []string{"nullptr", "#resource", "union", "pack(", "enum class"}
 
 // mqlDialect stamps the file's dialect: mql4/mql5 from the extension, content
