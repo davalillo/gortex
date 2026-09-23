@@ -154,6 +154,38 @@ func TestMQLExtractor_EmptyInput(t *testing.T) {
 	assert.Empty(t, result.Edges)
 }
 
+// TestMQLExtractor_InputDeclaratorForms: every declarator of an input/
+// sinput/extern declaration must mint a variable — array declarators
+// (`input double Rates[][6];`), comma-separated declarators
+// (`extern int A, B;`) and pointer declarators (`extern CArrayObj *Ptr;`)
+// included. Before the fix these were silently dropped: only initialized
+// declarators (`input int X = 5;`) survived.
+func TestMQLExtractor_InputDeclaratorForms(t *testing.T) {
+	src := []byte(`input double Rates[][6];
+extern int A, B;
+extern CArrayObj *Ptr;
+input int X = 5;
+`)
+	e := NewMQLExtractor()
+	result, err := e.Extract("inputs.mq5", src)
+	require.NoError(t, err)
+
+	want := map[string]string{
+		"Rates": "input",
+		"A":     "extern",
+		"B":     "extern",
+		"Ptr":   "extern",
+		"X":     "input",
+	}
+	got := map[string]string{}
+	for _, n := range nodesOfKind(result.Nodes, graph.KindVariable) {
+		sc, ok := n.Meta["storage_class"].(string)
+		require.True(t, ok, "variable %s missing storage_class meta", n.Name)
+		got[n.Name] = sc
+	}
+	assert.Equal(t, want, got)
+}
+
 // TestMQLDialect_Stamping: dialect comes from the extension for .mq4/.mq5,
 // and from content sniffing for .mqh headers (MQL5 markers win, otherwise
 // the documented mql4 default).

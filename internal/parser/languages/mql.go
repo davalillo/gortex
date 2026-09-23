@@ -481,9 +481,60 @@ func (e *MQLExtractor) emitMqlInclude(m parser.QueryResult, filePath, fileID str
 	})
 }
 
+// mqlDeclaratorEntry is one declarator of a top-level declaration: its base
+// identifier and start line.
+type mqlDeclaratorEntry struct {
+	name string
+	line int
+}
+
+// mqlDeclaratorEntries collects one entry per declarator of a top-level
+// declaration. MQL input declarations surface in every tree-sitter-c
+// declarator shape: plain identifiers (`extern int A, B;` — multiple
+// `declarator` fields, no init), array declarators (`input double
+// Rates[][6];`), pointer declarators (`extern CArrayObj *Ptr;`) and
+// initialized declarators (`input int X = 5;`). Function declarators
+// (`extern void f();`) are declarations of functions, not variables, and are
+// skipped.
+func mqlDeclaratorEntries(decl *sitter.Node, src []byte) []mqlDeclaratorEntry {
+	var out []mqlDeclaratorEntry
+	for i, nc := 0, int(decl.NamedChildCount()); i < nc; i++ {
+		child := decl.NamedChild(i)
+		switch child.Type() {
+		// Type-only filter: a declaration's named children of these kinds are
+		// always declarators (types surface as type_identifier/primitive_type/
+		// struct_specifier, never as bare identifiers). Do NOT gate on
+		// FieldNameForChild == "declarator": with comma-separated declarators
+		// only the first carries the field name in the tree-sitter-c grammar.
+		case "identifier", "init_declarator", "array_declarator", "pointer_declarator":
+			if name := mqlDeclaratorName(child, src); name != "" {
+				out = append(out, mqlDeclaratorEntry{name: name, line: int(child.StartPoint().Row) + 1})
+			}
+		}
+	}
+	return out
+}
+
+// mqlDeclaratorName resolves a declarator node to its base identifier,
+// descending through init/array/pointer declarators.
+func mqlDeclaratorName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "identifier":
+		return n.Content(src)
+	case "init_declarator", "array_declarator", "pointer_declarator":
+		return mqlDeclaratorName(n.ChildByFieldName("declarator"), src)
+	default:
+		return ""
+	}
+}
+
 // emitMqlInputs extracts top-level input / sinput / extern variable
 // declarations — an EA's user-facing configuration surface — as KindVariable
-// nodes with the storage class on Meta.
+// nodes with the storage class on Meta. Every declarator of the declaration
+// mints its own variable (see mqlDeclaratorEntries).
 func (e *MQLExtractor) emitMqlInputs(root *sitter.Node, src []byte, filePath, fileID string, result *parser.ExtractionResult, seen map[string]bool) {
 	for i, nc := 0, int(root.NamedChildCount()); i < nc; i++ {
 		decl := root.NamedChild(i)
@@ -501,31 +552,20 @@ func (e *MQLExtractor) emitMqlInputs(root *sitter.Node, src []byte, filePath, fi
 		if storage != "input" && storage != "sinput" && storage != "extern" {
 			continue
 		}
-		// Name: declaration -> init_declarator -> declarator (identifier).
-		var name string
-		for j, nc2 := 0, int(decl.NamedChildCount()); j < nc2; j++ {
-			child := decl.NamedChild(j)
-			if child.Type() != "init_declarator" {
+		for _, entry := range mqlDeclaratorEntries(decl, src) {
+			if seen[filePath+"::"+entry.name] {
 				continue
 			}
-			if d := child.ChildByFieldName("declarator"); d != nil {
-				name = d.Content(src)
-			}
-			break
+			seen[filePath+"::"+entry.name] = true
+			id := filePath + "::" + entry.name
+			result.Nodes = append(result.Nodes, &graph.Node{
+				ID: id, Kind: graph.KindVariable, Name: entry.name,
+				FilePath: filePath, StartLine: entry.line, EndLine: int(decl.EndPoint().Row) + 1,
+				Language: "mql", Meta: map[string]any{"storage_class": storage},
+			})
+			result.Edges = append(result.Edges, &graph.Edge{
+				From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: entry.line,
+			})
 		}
-		if name == "" || seen[filePath+"::"+name] {
-			continue
-		}
-		seen[filePath+"::"+name] = true
-		line := int(decl.StartPoint().Row) + 1
-		id := filePath + "::" + name
-		result.Nodes = append(result.Nodes, &graph.Node{
-			ID: id, Kind: graph.KindVariable, Name: name,
-			FilePath: filePath, StartLine: line, EndLine: int(decl.EndPoint().Row) + 1,
-			Language: "mql", Meta: map[string]any{"storage_class": storage},
-		})
-		result.Edges = append(result.Edges, &graph.Edge{
-			From: fileID, To: id, Kind: graph.EdgeDefines, FilePath: filePath, Line: line,
-		})
 	}
 }
