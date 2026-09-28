@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"iter"
 	"sync"
-	"time"
+	"sync/atomic"
 	"unsafe"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -615,40 +615,56 @@ func (p *Parser) Reset() {
 // ParseCtx parses src under ctx's deadline, returning a *Tree the
 // caller must Close. Two cancellation mechanisms are armed:
 //
-//   - The parser's end-clock (SetTimeoutMicros from ctx's deadline).
-//     tree-sitter checks that clock in every phase — including the
-//     tree-balancing pass, where the ProgressCallback is never invoked
-//     (parser.c ts_parser__check_progress passes position == NULL there).
-//     Without the clock, a parse stuck in error-recovery balancing runs
-//     unbounded no matter what the context says.
+//   - The cancellation flag, which tree-sitter consults in every phase —
+//     including the tree-balancing pass, where the ProgressCallback is
+//     never invoked (parser.c ts_parser__check_progress passes
+//     position == NULL there and skips the callback). Without it, a parse
+//     stuck in error-recovery balancing runs unbounded no matter what the
+//     context says.
 //   - The ProgressCallback, which aborts promptly during the advance
 //     loop once ctx is done.
 //
-// The clock is cleared on return so a pooled parser never carries a
-// stale budget into an unrelated parse.
+// The binding's flag/timeout APIs are deprecated in 0.25 in favor of the
+// callback alone, but the callback alone cannot cancel a balancing phase —
+// this shim is the designated place to own that trade-off. The flag pointer
+// is cleared on return on every path: a pooled parser left pointing at a
+// dead stack variable would read garbage on its next parse.
 func (p *Parser) ParseCtx(ctx context.Context, old *Tree, src []byte) (*Tree, error) {
 	var oldTree *ts.Tree
 	if old != nil {
 		oldTree = old.inner
 	}
-	deadline, hasDeadline := ctx.Deadline()
-	if hasDeadline {
-		if remaining := time.Until(deadline); remaining <= 0 {
-			return nil, fmt.Errorf("tree-sitter parse: %w", context.DeadlineExceeded)
-		} else {
-			p.inner.SetTimeoutMicros(uint64(remaining.Microseconds()))
-		}
-		defer p.inner.SetTimeoutMicros(0)
-	}
 	cancelled := false
+	var cancelFlag uintptr
+	p.inner.SetCancellationFlag(&cancelFlag) //nolint:staticcheck // SA1019: the progress callback alone cannot cancel the balancing phase; see ParseCtx doc
+	defer p.inner.SetCancellationFlag(nil)   //nolint:staticcheck // SA1019: same — never leave the pooled parser pointing at our stack
+
 	opts := &ts.ParseOptions{
 		ProgressCallback: func(_ ts.ParseState) bool {
 			if ctx.Err() != nil {
 				cancelled = true
+				atomic.StoreUintptr(&cancelFlag, 1)
 				return true // true aborts the parse
 			}
 			return false
 		},
+	}
+	// Arm the flag from a watcher so a parse wedged in balancing (where the
+	// callback never runs) still observes the deadline.
+	finish := make(chan struct{})
+	done := make(chan struct{})
+	if ctx.Done() != nil {
+		go func() {
+			defer close(done)
+			select {
+			case <-ctx.Done():
+				cancelled = true
+				atomic.StoreUintptr(&cancelFlag, 1)
+			case <-finish:
+			}
+		}()
+	} else {
+		close(done)
 	}
 	tree := p.inner.ParseWithOptions(func(offset int, _ ts.Point) []byte {
 		if offset >= len(src) {
@@ -656,17 +672,14 @@ func (p *Parser) ParseCtx(ctx context.Context, old *Tree, src []byte) (*Tree, er
 		}
 		return src[offset:]
 	}, oldTree, opts)
+	close(finish)
+	<-done // the watcher must be finished before the flag goes inert
 	if tree == nil {
 		if cancelled {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			return nil, errors.New("tree-sitter: parse cancelled")
-		}
-		if hasDeadline {
-			// The C end-clock can fire a hair before Go's deadline flips
-			// ctx.Err(); either way the budget was exceeded.
-			return nil, fmt.Errorf("tree-sitter parse: %w", context.DeadlineExceeded)
 		}
 		return nil, fmt.Errorf("tree-sitter: parse returned nil")
 	}
