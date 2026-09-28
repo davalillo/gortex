@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"iter"
 	"sync"
+	"time"
 	"unsafe"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
@@ -612,13 +613,32 @@ func (p *Parser) Reset() {
 }
 
 // ParseCtx parses src under ctx's deadline, returning a *Tree the
-// caller must Close. Cancellation is polled via a ProgressCallback;
-// exact-to-the-byte interruption isn't guaranteed — tree-sitter calls
-// the callback at its own cadence.
+// caller must Close. Two cancellation mechanisms are armed:
+//
+//   - The parser's end-clock (SetTimeoutMicros from ctx's deadline).
+//     tree-sitter checks that clock in every phase — including the
+//     tree-balancing pass, where the ProgressCallback is never invoked
+//     (parser.c ts_parser__check_progress passes position == NULL there).
+//     Without the clock, a parse stuck in error-recovery balancing runs
+//     unbounded no matter what the context says.
+//   - The ProgressCallback, which aborts promptly during the advance
+//     loop once ctx is done.
+//
+// The clock is cleared on return so a pooled parser never carries a
+// stale budget into an unrelated parse.
 func (p *Parser) ParseCtx(ctx context.Context, old *Tree, src []byte) (*Tree, error) {
 	var oldTree *ts.Tree
 	if old != nil {
 		oldTree = old.inner
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		if remaining := time.Until(deadline); remaining <= 0 {
+			return nil, fmt.Errorf("tree-sitter parse: %w", context.DeadlineExceeded)
+		} else {
+			p.inner.SetTimeoutMicros(uint64(remaining.Microseconds()))
+		}
+		defer p.inner.SetTimeoutMicros(0)
 	}
 	cancelled := false
 	opts := &ts.ParseOptions{
@@ -642,6 +662,11 @@ func (p *Parser) ParseCtx(ctx context.Context, old *Tree, src []byte) (*Tree, er
 				return nil, err
 			}
 			return nil, errors.New("tree-sitter: parse cancelled")
+		}
+		if hasDeadline {
+			// The C end-clock can fire a hair before Go's deadline flips
+			// ctx.Err(); either way the budget was exceeded.
+			return nil, fmt.Errorf("tree-sitter parse: %w", context.DeadlineExceeded)
 		}
 		return nil, fmt.Errorf("tree-sitter: parse returned nil")
 	}
