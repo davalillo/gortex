@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,6 +147,40 @@ func TestParseFile_RejectsUTF16Source(t *testing.T) {
 		tree, err := ParseFile(append([]byte{0xEF, 0xBB, 0xBF}, body...), golang.GetLanguage())
 		require.NoError(t, err)
 		require.NotNil(t, tree)
+		tree.Close()
+	})
+}
+
+// TestParseFile_RejectsBinarySource pins the binary-content guard: a
+// NUL byte in the sniff window means the bytes are not text any grammar
+// can consume (a tool-cache .pkl claimed by the Pkl extension was the
+// reported case), and the guard must fail fast — before the parse pool
+// or any error-recovery balancing work.
+func TestParseFile_RejectsBinarySource(t *testing.T) {
+	pickle := append([]byte("\x80\x04\x95\x1a\x00\x00"), make([]byte, 512)...)
+	start := time.Now()
+	tree, err := ParseFile(pickle, golang.GetLanguage())
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, ErrBinarySource)
+	assert.Nil(t, tree)
+	assert.Less(t, elapsed, time.Second,
+		"the binary guard must fail fast, before any parse work")
+
+	t.Run("nul-beyond-window-is-not-sniffed", func(t *testing.T) {
+		// The sniff covers the first 8 KiB only. Text whose first NUL
+		// sits past the window parses (tree-sitter is error-tolerant);
+		// the indexer's own sniff of the full prefix is what catches it.
+		late := append([]byte(strings.Repeat("a", binarySniffBytes)), 0x00)
+		tree, err := ParseFile(late, golang.GetLanguage())
+		if err == nil {
+			tree.Close()
+		}
+		require.NoError(t, err)
+	})
+
+	t.Run("text-still-parses", func(t *testing.T) {
+		tree, err := ParseFile([]byte("package main\n\nfunc A() {}\n"), golang.GetLanguage())
+		require.NoError(t, err)
 		tree.Close()
 	})
 }
