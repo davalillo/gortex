@@ -63,9 +63,13 @@ func (mi *MultiIndexer) RebuildSymbolFTS(reporter progress.Reporter) error {
 
 // rebuildSymbolFTS repopulates one repo's FTS corpus from resident nodes. It
 // mirrors populateSymbolFTS's chunking (same row/byte bounds, same admission,
-// same token derivation) but streams through the set-oriented
-// graph.NodesInScopeSeq adapter — the only streaming shape the memory backend
-// offers — instead of the store-implemented ScopedProjectionSequencer.
+// same token derivation). Streaming goes over the store's own AllNodes
+// surface with the set-oriented scope predicate (exact RepoPrefix equality —
+// the same matching ReadRepoNodeIDsByKinds' fallback applies) instead of
+// graph.NodesInScopeSeq: that adapter requires an explicit kind list (empty
+// kinds yield an empty sequence by design) and the FTS corpus must not drift
+// whenever a new NodeKind is added — admission stays in
+// shouldIndexForSearch, which already encodes which kinds are searchable.
 func (idx *Indexer) rebuildSymbolFTS(reporter progress.Reporter) (int, error) {
 	batcher, ok := idx.graph.(graph.SymbolFTSBatchUpserter)
 	if !ok {
@@ -91,8 +95,11 @@ func (idx *Indexer) rebuildSymbolFTS(reporter progress.Reporter) (int, error) {
 		pending = 0
 		return nil
 	}
-	for node := range graph.NodesInScopeSeq(idx.graph, []string{repoPrefix}, nil) {
-		if node == nil || !idx.shouldIndexForSearch(node) {
+	for _, node := range idx.graph.AllNodes() {
+		if node == nil || node.RepoPrefix != repoPrefix {
+			continue
+		}
+		if !idx.shouldIndexForSearch(node) {
 			continue
 		}
 		tokens := ftsTokensFor(node, idx.projectName)
