@@ -48,7 +48,7 @@ func OpenBackend(name, path string, logger *zap.Logger, allowRebuild bool, obser
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "memory", "mem", "in-memory":
-		return openMemoryBackend(resolved, logger)
+		return openMemoryBackend(resolved, logger, observers...)
 	default:
 		return openSqliteBackend(resolved, allowRebuild, observers...)
 	}
