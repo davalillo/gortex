@@ -98,7 +98,7 @@ func buildDaemonState(logger *zap.Logger, observers ...store_sqlite.MigrationObs
 	}
 	ss, err := serverstack.NewSharedServer(serverstack.SharedServerConfig{
 		Lifecycle:         serverstack.LifecycleDaemon,
-		Backend:           daemonBackend,
+		Backend:           resolveDaemonBackend(daemonBackend, os.Getenv("GORTEX_STORE"), gc),
 		BackendPath:       daemonBackendPath,
 		Config:            cfg,
 		Global:            gc,

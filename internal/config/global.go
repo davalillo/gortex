@@ -118,6 +118,13 @@ type DaemonConfig struct {
 	// overridden by GORTEX_DAEMON_HTTP_ADDR; a non-empty --http-addr flag
 	// overrides both. Non-loopback binds require an auth token.
 	HTTPAddr string `mapstructure:"http_addr" yaml:"http_addr,omitempty"`
+
+	// Backend selects the graph store backend the daemon opens at boot
+	// ("sqlite" — the default — or "memory", the Tier-3 memory-resident
+	// backend). Empty selects sqlite. The GORTEX_STORE environment
+	// variable overrides this, and a non-empty --backend flag overrides
+	// both (flag > env > config, resolved once at startup).
+	Backend string `mapstructure:"backend" yaml:"backend,omitempty"`
 }
 
 // GlobalMCPConfig is the `mcp:` block in ~/.gortex/config.yaml. It contains
