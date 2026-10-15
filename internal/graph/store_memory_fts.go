@@ -133,8 +133,11 @@ func (m *MemoryStore) ReplaceSymbolFTS(repoPrefix string, produce func(emit func
 // ensureFTSEngineNodes mirrors the documents' node rows into the engine
 // before an incremental FTS upsert: upsertSymbolFTSChunkTx derives the owning
 // repo prefix by joining the engine's OWN nodes table (LEFT JOIN nodes ... →
-// COALESCE(repo_prefix, '')), and a missing row would file the document under
-// the unowned empty prefix, which every repo-scope filter lets through.
+// COALESCE(repo_prefix, '')). A missing row files the document under the
+// unowned empty prefix: deliberate globals (dep:: externals) keep passing
+// every repo scope, but an orphaned doc — node row gone — is excluded from
+// scoped searches (see store_sqlite's scoped scope predicate), so a stale
+// mirror would silently drop real symbols from scoped results.
 // Copies are upsert-by-ID, in RAM only, and bounded by the FTS-admitted node
 // set — never the whole graph.
 func (m *MemoryStore) ensureFTSEngineNodes(items []SymbolFTSItem) error {

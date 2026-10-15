@@ -24,6 +24,14 @@ import (
 // its FTS batch-upsert capability, so the corpus is identical whichever path
 // produced it. On the sqlite backend the daemon never calls this — FTS is
 // persisted store state the indexer's own paths maintain.
+//
+// The walk is ONE AllNodes pass per distinct backing graph (issue
+// davalillo/gortex#25, R4-fts-rebuild-full-rescan-per-repo): every repo used
+// to re-walk the whole store and filter by its own prefix — O(repos × nodes),
+// the dominant warm-boot cost on the memory backend (~9 s at 5 repos /
+// 226k nodes). The single pass partitions nodes by prefix and feeds each
+// indexer exactly the bucket its per-repo walk would have selected, in the
+// same order, so the corpus and chunk boundaries are unchanged.
 func (mi *MultiIndexer) RebuildSymbolFTS(reporter progress.Reporter) error {
 	if mi == nil {
 		return nil
@@ -43,14 +51,44 @@ func (mi *MultiIndexer) RebuildSymbolFTS(reporter progress.Reporter) error {
 	}
 	mi.mu.Unlock()
 
+	// Group the indexers by backing graph so each distinct store is walked
+	// exactly once. In the daemon every indexer shares one store; the
+	// grouping only keeps the single-repo / test shapes honest.
+	byGraph := make(map[graph.Store][]*Indexer, 1)
+	graphOrder := make([]graph.Store, 0, 1)
+	for _, idx := range indexers {
+		if _, ok := byGraph[idx.graph]; !ok {
+			graphOrder = append(graphOrder, idx.graph)
+		}
+		byGraph[idx.graph] = append(byGraph[idx.graph], idx)
+	}
+
 	started := time.Now()
 	written := 0
-	for _, idx := range indexers {
-		n, err := idx.rebuildSymbolFTS(reporter)
-		if err != nil {
-			return err
+	if reporter != nil {
+		reporter.Report("building symbol fts", 0, 0)
+	}
+	for _, g := range graphOrder {
+		buckets := partitionNodesByPrefix(g.AllNodes())
+		for _, idx := range byGraph[g] {
+			n, err := idx.rebuildSymbolFTSBucket(buckets[idx.RepoPrefix()], reporter)
+			if err != nil {
+				return err
+			}
+			written += n
 		}
-		written += n
+		// Finalize the engine-side index once per graph (FTS5 'optimize' on
+		// the sqlite engine — the same finalize populateSymbolFTS runs). The
+		// per-repo walk finalized after every repo; one finalize per graph
+		// merges the same segments at a fraction of the calls.
+		if searcher, ok := g.(graph.SymbolSearcher); ok {
+			if err := searcher.BuildSymbolIndex(); err != nil {
+				return fmt.Errorf("indexer: finalize backend FTS: %w", err)
+			}
+		}
+	}
+	if reporter != nil {
+		reporter.Report("building symbol fts", 1, 1)
 	}
 	if mi.logger != nil {
 		mi.logger.Info("indexer: symbol FTS rebuilt from resident state",
@@ -61,23 +99,64 @@ func (mi *MultiIndexer) RebuildSymbolFTS(reporter progress.Reporter) error {
 	return nil
 }
 
+// partitionNodesByPrefix groups one AllNodes stream into per-repo buckets,
+// dropping nil nodes and preserving the walk order inside each bucket (the
+// chunking order the per-repo walk produced). The "" bucket holds the
+// deliberate unowned globals (dep:: externals); no indexer owns that prefix,
+// so the bucket is simply never consumed — same as the old per-repo filter.
+func partitionNodesByPrefix(nodes []*graph.Node) map[string][]*graph.Node {
+	buckets := make(map[string][]*graph.Node)
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		buckets[node.RepoPrefix] = append(buckets[node.RepoPrefix], node)
+	}
+	return buckets
+}
+
 // rebuildSymbolFTS repopulates one repo's FTS corpus from resident nodes. It
 // mirrors populateSymbolFTS's chunking (same row/byte bounds, same admission,
-// same token derivation). Streaming goes over the store's own AllNodes
+// same token derivation). The node stream comes from the store's own AllNodes
 // surface with the set-oriented scope predicate (exact RepoPrefix equality —
 // the same matching ReadRepoNodeIDsByKinds' fallback applies) instead of
 // graph.NodesInScopeSeq: that adapter requires an explicit kind list (empty
 // kinds yield an empty sequence by design) and the FTS corpus must not drift
 // whenever a new NodeKind is added — admission stays in
 // shouldIndexForSearch, which already encodes which kinds are searchable.
+// Single-repo shape; the multi-repo daemon path goes through
+// MultiIndexer.RebuildSymbolFTS's one-pass partition instead.
 func (idx *Indexer) rebuildSymbolFTS(reporter progress.Reporter) (int, error) {
+	repoPrefix := idx.RepoPrefix()
+	var matching []*graph.Node
+	for _, node := range idx.graph.AllNodes() {
+		if node == nil || node.RepoPrefix != repoPrefix {
+			continue
+		}
+		matching = append(matching, node)
+	}
+	written, err := idx.rebuildSymbolFTSBucket(matching, reporter)
+	if err != nil {
+		return written, err
+	}
+	// Finalize the engine-side index (FTS5 'optimize' on the sqlite engine —
+	// the same finalize populateSymbolFTS runs).
+	if searcher, ok := idx.graph.(graph.SymbolSearcher); ok {
+		if err := searcher.BuildSymbolIndex(); err != nil {
+			return written, fmt.Errorf("indexer: finalize backend FTS: %w", err)
+		}
+	}
+	return written, nil
+}
+
+// rebuildSymbolFTSBucket admits, tokenizes and chunk-upserts one repo's
+// already-partitioned node bucket. It is the admission/chunking core shared
+// by the single-repo walk and the multi-repo one-pass partition — the corpus
+// cannot drift between the two shapes because they run the same code.
+func (idx *Indexer) rebuildSymbolFTSBucket(nodes []*graph.Node, reporter progress.Reporter) (int, error) {
 	batcher, ok := idx.graph.(graph.SymbolFTSBatchUpserter)
 	if !ok {
 		return 0, nil
-	}
-	repoPrefix := idx.RepoPrefix()
-	if reporter != nil {
-		reporter.Report("building symbol fts", 0, 0)
 	}
 
 	items := make([]graph.SymbolFTSItem, 0, symbolFTSDirectChunkRows)
@@ -95,10 +174,7 @@ func (idx *Indexer) rebuildSymbolFTS(reporter progress.Reporter) (int, error) {
 		pending = 0
 		return nil
 	}
-	for _, node := range idx.graph.AllNodes() {
-		if node == nil || node.RepoPrefix != repoPrefix {
-			continue
-		}
+	for _, node := range nodes {
 		if !idx.shouldIndexForSearch(node) {
 			continue
 		}
@@ -113,16 +189,6 @@ func (idx *Indexer) rebuildSymbolFTS(reporter progress.Reporter) (int, error) {
 	}
 	if err := flush(); err != nil {
 		return written, fmt.Errorf("indexer: rebuild symbol fts: %w", err)
-	}
-	// Finalize the engine-side index (FTS5 'optimize' on the sqlite engine —
-	// the same finalize populateSymbolFTS runs).
-	if searcher, ok := idx.graph.(graph.SymbolSearcher); ok {
-		if err := searcher.BuildSymbolIndex(); err != nil {
-			return written, fmt.Errorf("indexer: finalize backend FTS: %w", err)
-		}
-	}
-	if reporter != nil {
-		reporter.Report("building symbol fts", 1, 1)
 	}
 	return written, nil
 }
