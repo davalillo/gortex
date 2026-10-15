@@ -7,11 +7,30 @@ import (
 	"github.com/zzet/gortex/internal/graph"
 )
 
-// ftsMirrorChunkRows bounds the rows per lean mirror statement. Each row
-// binds 6 host params (id, view_gen, kind, name, file_path, repo_prefix);
-// 512 rows is 3072 params, comfortably under SQLite's variable ceiling even
-// after the automatic fallback accounting in addBatchSetOriented.
+// ftsMirrorChunkRows bounds the rows per lean mirror read/write statement —
+// the shape policy the lean mirror was tuned with, not a variable-limit
+// assumption: mirrorChunkSizes derives the actual row counts from the
+// store's runtime SQLite variable limit (each write row binds
+// mirrorRowParams host params; each read row binds 2 plus the view_gen
+// join), so a build with a conservative SQLITE_LIMIT_VARIABLE_NUMBER gets
+// smaller statements instead of a prepare failure.
 const ftsMirrorChunkRows = 512
+
+// mirrorRowParams is the bind count one mirror write row carries (id,
+// view_gen, kind, name, file_path, repo_prefix).
+const mirrorRowParams = 6
+
+// mirrorChunkSizes derives the per-statement row counts for the lean mirror
+// from the store's probed variable limit (issue #36,
+// R3-sql-var-ceiling-mirror-read): the write binds mirrorRowParams per row,
+// the diff read binds 2 per id plus one view_gen bind — accounted by
+// lowering the limit by one before the shared headroom math. Both stay
+// capped by ftsMirrorChunkRows.
+func mirrorChunkSizes(variableLimit int) (writeRows, readRows int) {
+	writeRows = batchRowsForVariableLimit(variableLimit, mirrorRowParams, ftsMirrorChunkRows)
+	readRows = batchRowsForVariableLimit(variableLimit-1, 2, ftsMirrorChunkRows)
+	return writeRows, readRows
+}
 
 // mirrorRow is the six-column mirror projection a node row carries for the
 // engine's FTS readers: the filing join (repo_prefix), tier-0 exact-name
@@ -34,7 +53,10 @@ type mirrorRow struct {
 // predicate see exactly the rows they would see through AddBatch — pinned
 // by store_fts_mirror_test.go.
 //
-// The write is diffed against the mirrored state: rows whose six-column
+// The write is diffed against the mirrored state and is update-only on
+// conflict: a row already carrying a full node keeps its non-mirrored
+// columns (INSERT OR REPLACE would wipe them — issue #36,
+// R3-replace-delete-side-effects): rows whose six-column
 // projection is unchanged are skipped, so steady-state rebuilds (the same
 // resident graph re-mirrored at every boot) pay one set-oriented read pass
 // instead of a full rewrite — rewriting 100k rows through the nodes table's
@@ -67,6 +89,9 @@ func (s *Store) MirrorFTSNodes(nodes []*graph.Node) error {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	variableLimit := s.sqliteBatchVariableLimitLocked()
+	writeRows, readRows := mirrorChunkSizes(variableLimit)
+
 	tx, err := s.beginWrite()
 	if err != nil {
 		return err
@@ -78,18 +103,23 @@ func (s *Store) MirrorFTSNodes(nodes []*graph.Node) error {
 		chunk := order[start:end]
 
 		// One set-oriented read of the mirrored projection for the whole
-		// chunk; rows already carrying the exact projection are skipped.
-		existing, err := s.mirrorExistingTx(tx, chunk)
-		if err != nil {
-			return err
+		// chunk, sub-chunked under the store's SQLite variable ceiling (2
+		// binds per id plus the view_gen join) — the same accounting the
+		// AddBatch write path applies to its statements.
+		existing := make(map[string]mirrorRow, len(chunk))
+		for rs := 0; rs < len(chunk); rs += readRows {
+			re := minInt(rs+readRows, len(chunk))
+			part, err := s.mirrorExistingTx(tx, chunk[rs:re])
+			if err != nil {
+				return err
+			}
+			for id, row := range part {
+				existing[id] = row
+			}
 		}
 
-		var (
-			sb   strings.Builder
-			args = make([]any, 0, len(chunk)*6)
-		)
-		sb.WriteString(`INSERT OR REPLACE INTO nodes (id, view_gen, kind, name, file_path, repo_prefix) VALUES `)
-		first := true
+		// Collect the rows whose six-column projection actually changed.
+		pending := make([]string, 0, len(chunk))
 		for _, id := range chunk {
 			want := byID[id]
 			if have, ok := existing[id]; ok && have.present &&
@@ -97,18 +127,37 @@ func (s *Store) MirrorFTSNodes(nodes []*graph.Node) error {
 				have.filePath == want.filePath && have.repoPrefix == want.repo {
 				continue
 			}
-			if !first {
-				sb.WriteByte(',')
+			pending = append(pending, id)
+		}
+
+		for ws := 0; ws < len(pending); ws += writeRows {
+			we := minInt(ws+writeRows, len(pending))
+			var (
+				sb   strings.Builder
+				args = make([]any, 0, (we-ws)*mirrorRowParams)
+			)
+			sb.WriteString(`INSERT INTO nodes (id, view_gen, kind, name, file_path, repo_prefix) VALUES `)
+			for i, id := range pending[ws:we] {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(`(?, ?, ?, ?, ?, ?)`)
+				want := byID[id]
+				args = append(args, id, s.viewGen, want.kind, want.name, want.filePath, want.repo)
 			}
-			first = false
-			sb.WriteString(`(?, ?, ?, ?, ?, ?)`)
-			args = append(args, id, s.viewGen, want.kind, want.name, want.filePath, want.repo)
-		}
-		if first {
-			continue
-		}
-		if _, err := tx.Exec(sb.String(), args...); err != nil {
-			return err
+			// ON CONFLICT UPDATE instead of INSERT OR REPLACE: REPLACE is a
+			// delete+insert of the whole row — on a row already carrying a
+			// full AddBatch-written node it resets every non-mirrored column
+			// to its DDL default and fires any delete-side triggers / FK
+			// actions per replaced row (issue #36,
+			// R3-replace-delete-side-effects). The update touches only the
+			// six mirrored columns; the diff pass above guarantees every row
+			// reaching this statement is a real change.
+			sb.WriteString(` ON CONFLICT(id, view_gen) DO UPDATE SET ` +
+				`kind=excluded.kind, name=excluded.name, file_path=excluded.file_path, repo_prefix=excluded.repo_prefix`)
+			if _, err := tx.Exec(sb.String(), args...); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

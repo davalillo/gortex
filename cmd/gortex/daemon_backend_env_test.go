@@ -6,6 +6,25 @@ import (
 	"github.com/zzet/gortex/internal/config"
 )
 
+// TestDaemonBackendFlagDefaultEmpty (issue #36,
+// R3-default-flag-empty-readers): the --backend flag registers with an
+// empty default; the empty string means "not set" and is only meaningful
+// through resolveDaemonBackend, which maps it to sqlite. This pins both
+// halves of the contract: the registered flag default, and the resolver's
+// empty handling on its sole consumer path.
+func TestDaemonBackendFlagDefaultEmpty(t *testing.T) {
+	f := daemonStartCmd.Flags().Lookup("backend")
+	if f == nil {
+		t.Fatalf("--backend flag not registered on daemon start")
+	}
+	if f.DefValue != "" {
+		t.Fatalf("--backend default = %q, want empty (empty means sqlite via resolveDaemonBackend)", f.DefValue)
+	}
+	if got := resolveDaemonBackend(f.DefValue, "", nil); got != "sqlite" {
+		t.Fatalf("resolveDaemonBackend(%q) = %q, want sqlite", f.DefValue, got)
+	}
+}
+
 func TestResolveDaemonBackendPrecedence(t *testing.T) {
 	tests := []struct {
 		name string
