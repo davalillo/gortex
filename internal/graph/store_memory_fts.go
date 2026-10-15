@@ -34,6 +34,23 @@ type FTSEngine interface {
 	AddBatch(nodes []*Node, edges []*Edge)
 }
 
+// FTSNodeMirror is an optional engine capability: a cheap node-row mirror
+// write for FTS filing. The full AddBatch path carries everything a graph
+// write needs — analysis invalidation, mutation receipts, builtin stubs,
+// JSONB payload encoding — while the engine's mirror readers need only
+// (id, view_gen, kind, name, file_path, repo_prefix): the FTS filing join
+// derives the owning repo prefix from it, the tier-0 exact-name lookup
+// reads name/kind, and the scoped-search orphan predicate probes id.
+// Writers that hold the nodes in hand (the warm-boot rebuild feeds the
+// engine chunk by chunk straight from resident state) should prefer this
+// over AddBatch: measured at ~55% of a 100k-node rebuild on the JSONB path
+// versus ~2 µs/row on the lean insert. Implementations must upsert by
+// (id, view_gen) with last-write-wins, so re-mirroring an updated node
+// behaves exactly like AddBatch.
+type FTSNodeMirror interface {
+	MirrorFTSNodes(nodes []*Node) error
+}
+
 // MemoryOption configures NewMemoryStore.
 type MemoryOption func(*MemoryStore)
 
@@ -169,6 +186,14 @@ func (m *MemoryStore) ensureFTSEngineNodes(items []SymbolFTSItem) error {
 	}
 	if len(stubs) == 0 {
 		return nil
+	}
+	// Prefer the lean mirror write when the engine offers it: the FTS
+	// filing join, tier-0 exact-name lookups and the orphan predicate need
+	// only six columns, and the full AddBatch path pays for the whole
+	// graph-write machinery (analysis invalidation, receipts, JSONB payload
+	// encoding) the mirror never reads — ~55% of a 100k-node rebuild.
+	if mirror, ok := e.(FTSNodeMirror); ok {
+		return mirror.MirrorFTSNodes(stubs)
 	}
 	e.AddBatch(stubs, nil)
 	return nil
