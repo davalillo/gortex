@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/renameio"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/google/renameio"
 	"gopkg.in/yaml.v3"
 
 	"github.com/zzet/gortex/internal/llm"
@@ -125,6 +125,13 @@ type DaemonConfig struct {
 	// variable overrides this, and a non-empty --backend flag overrides
 	// both (flag > env > config, resolved once at startup).
 	Backend string `mapstructure:"backend" yaml:"backend,omitempty"`
+	// LogMaxSize is the daemon log rotation threshold in MB (default 50).
+	// Zero disables rotation and keeps logging to stderr. Pointers distinguish
+	// an omitted value from an explicit zero.
+	LogMaxSize *int `mapstructure:"log_max_size" yaml:"log_max_size,omitempty"`
+	// LogMaxBackups is the number of rotated logs to retain (default 3,
+	// minimum 1). Smaller values warn and use the default.
+	LogMaxBackups *int `mapstructure:"log_max_backups" yaml:"log_max_backups,omitempty"`
 }
 
 // GlobalMCPConfig is the `mcp:` block in ~/.gortex/config.yaml. It contains
