@@ -86,6 +86,11 @@ func (l *CheckoutLifecycle) executeModeTransition(
 		}
 	}
 
+	// A transition runs git in the checkouts it moves (the builds it starts
+	// sample and list them); no racily clean index refresh may hold their
+	// index lock meanwhile.
+	release := l.gitWork.hold()
+	defer release()
 	switch transition.Cause {
 	case promotionTransitionCause:
 		result, err := l.executePromotionTransition(ctx, transition)
@@ -185,7 +190,7 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 			checkout.EffectiveMode == store_sqlite.CheckoutModeAutomatic &&
 			checkout.ActiveIntentTransitionID == "" {
 			prefix := l.ResolvePrefix(checkout.RootPath)
-			if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
+			if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath, reconcile.CauseDemotion); err != nil {
 				return fmt.Errorf("indexer: recover demotion configuration: %w", err)
 			}
 			return nil
@@ -201,7 +206,7 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 	}
 	transition = standing
 	if err := l.catalog.UpdateIntentTransitionProgress(ctx, transition.CheckoutID,
-		transition.TransitionID, store_sqlite.IntentTransitionRunning, "", l.now().Unix()); err != nil {
+		transition.TransitionID, store_sqlite.IntentTransitionRunning, "", l.clock().Unix()); err != nil {
 		return err
 	}
 	checkout, err := l.checkoutStateOf(ctx, transition.CheckoutID)
@@ -216,7 +221,7 @@ func (l *CheckoutLifecycle) executeDemotionTransition(
 				store_sqlite.ErrCatalogStaleGuard, transition.TransitionID, checkout.CheckoutID))
 		}
 		prefix := l.ResolvePrefix(checkout.RootPath)
-		if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath); err != nil {
+		if _, _, err := l.evictRepoChecked(ctx, prefix, checkout.RootPath, reconcile.CauseDemotion); err != nil {
 			return l.deferModeTransition(ctx, transition, fmt.Errorf(
 				"indexer: persist cleanup-pending demotion configuration: %w", err))
 		}
@@ -268,7 +273,7 @@ func (l *CheckoutLifecycle) deferModeTransition(
 	}
 	if err := l.catalog.UpdateIntentTransitionProgress(ctx, transition.CheckoutID,
 		transition.TransitionID, store_sqlite.IntentTransitionPending,
-		cause.Error(), l.now().Unix()); err != nil && !errors.Is(err, context.Canceled) {
+		cause.Error(), l.clock().Unix()); err != nil && !errors.Is(err, context.Canceled) {
 		l.logger.Warn("checkout lifecycle: could not defer mode transition",
 			zap.String("transition", transition.TransitionID), zap.Error(err))
 	}

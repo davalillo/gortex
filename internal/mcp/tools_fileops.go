@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/zeebo/blake3"
 	"io"
 	"math"
 	"os"
@@ -21,6 +23,8 @@ import (
 	"github.com/zzet/gortex/internal/elide"
 	"github.com/zzet/gortex/internal/graph"
 	"github.com/zzet/gortex/internal/indexer"
+	"github.com/zzet/gortex/internal/pathkey"
+	"github.com/zzet/gortex/internal/query"
 	"github.com/zzet/gortex/internal/tokens"
 )
 
@@ -770,8 +774,11 @@ func (s *Server) recordFileBaselineSavings(ctx context.Context, tool, relPath, l
 	// This charges the whole file as the counterfactual, so claim it for the
 	// session: a later retrieval page that merely cites the file must not
 	// bill it a second time (savings_retrieval.go).
-	stats.creditFile(abs)
-	stats.record(s.fileAttributionNode(relPath, language), tool, returned, fullFile)
+	node := s.fileAttributionNode(relPath, language)
+	afterFreshSymbolAcceptance(ctx, func() {
+		stats.creditFile(abs)
+		stats.record(node, tool, returned, fullFile)
+	})
 }
 
 // pendingSavings is one source-read observation assembled before an
@@ -827,10 +834,12 @@ func incrementalReindexSucceeded(result *indexer.IndexResult, err error) bool {
 
 // reindexFile refreshes the graph for a single file after a write. Best-effort:
 // non-source files or files outside any indexed repo are silently skipped.
-func (s *Server) reindexFile(absPath string) bool {
+func (s *Server) reindexFile(absPath string) bool { return s.reindexFileObserved(absPath, nil) }
+
+func (s *Server) reindexFileObserved(absPath string, observer *indexer.ReadRepairObserver) bool {
 	if s.multiIndexer != nil {
 		if prefix := s.multiIndexer.RepoForFile(absPath); prefix != "" {
-			result, err := s.multiIndexer.IncrementalReindexRepo(prefix, []string{absPath})
+			result, err := s.multiIndexer.IncrementalReindexRepoObserved(prefix, []string{absPath}, observer)
 			if incrementalReindexSucceeded(result, err) {
 				return true
 			}
@@ -922,7 +931,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("edit cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -932,7 +941,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// old_string, so an un-replayed retry would fail the match check with a
 	// confusing "not found" instead of returning the original result.
 	fingerprint := mutationFingerprint("edit_file", absPath, oldString, newString, strconv.FormatBool(replaceAll))
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1013,11 +1022,13 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = checkParseGate(relPath, content, newContentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, content, newContentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
+		indexer.StampPublicationPhase(ctx, indexer.PublicationParseGated)
 	}
 
 	if dryRun {
@@ -1047,7 +1058,8 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 	if info, err := os.Stat(absPath); err == nil {
 		perm = info.Mode().Perm()
 	}
-	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "edit_file", mutationID, fingerprint, relPath, absPath, newContentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("edit", commit, writeErr)), nil
@@ -1055,10 +1067,15 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
+	observeEditSourceEffect(ctx, true, true) // identical edits already refused above
+	observeEditSourceComplete(ctx)
+
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
@@ -1078,6 +1095,7 @@ func (s *Server) handleEditFile(ctx context.Context, req mcp.CallToolRequest) (*
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, content, true)
 	}
@@ -1112,7 +1130,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	if resolveErr != nil {
 		return mcp.NewToolResultError(resolveErr.Error()), nil
 	}
-	releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
+	ctx, releaseMutation, lockErr := acquireMutationPath(ctx, absPath)
 	if lockErr != nil {
 		return mcp.NewToolResultError("write cancelled while waiting for exclusive file access: " + lockErr.Error()), nil
 	}
@@ -1122,7 +1140,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	// call waits for it and then sees a terminal record, rather than both
 	// deciding independently that they are the first.
 	fingerprint := mutationFingerprint("write_file", absPath, content)
-	if replay, conflict, matched := s.replayMutation(mutationID, fingerprint); matched {
+	if replay, conflict, matched := s.replayMutationAfterPathRelease(ctx, mutationID, fingerprint, releaseMutation); matched {
 		if conflict != "" {
 			return mcp.NewToolResultError(conflict), nil
 		}
@@ -1132,6 +1150,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	status := "created"
 	perm := os.FileMode(0o644)
 	fileExists := false
+	fileExistenceKnown := false
 	if info, err := os.Stat(absPath); err == nil {
 		if info.IsDir() {
 			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
@@ -1139,6 +1158,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		status = "overwritten"
 		perm = info.Mode().Perm()
 		fileExists = true
+		fileExistenceKnown = true
+	} else {
+		fileExistenceKnown = errors.Is(err, os.ErrNotExist)
 	}
 
 	// Drift guard: when the caller observed the file at base_sha,
@@ -1164,8 +1186,11 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 	// Read the prior bytes once: the parse gate compares against them, and an
 	// evidence receipt digests them as before_sha256.
 	var priorContent []byte
+	priorContentKnown := fileExistenceKnown && !fileExists
 	if fileExists {
-		priorContent, _ = os.ReadFile(absPath)
+		var readErr error
+		priorContent, readErr = os.ReadFile(absPath)
+		priorContentKnown = readErr == nil
 	}
 	// Before anything is written, so a withheld receipt never leaves an
 	// overwritten file behind.
@@ -1177,8 +1202,9 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 
 	allowParseErrors := req.GetBool("allow_parse_errors", false)
 	var gate parseGateResult
+	var prepared *preparedFileProjection
 	if parseGateEnabled() {
-		gate = checkParseGate(relPath, priorContent, contentBytes)
+		prepared, gate = s.prepareAcknowledgedProjection(ctx, relPath, absPath, priorContent, contentBytes)
 		if gate.Blocked && !allowParseErrors && !dryRun {
 			return mcp.NewToolResultError(parseGateError(relPath, gate)), nil
 		}
@@ -1210,7 +1236,8 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return s.respondJSONOrTOON(ctx, req, preview)
 	}
 
-	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm)
+	commit, writeErr := s.commitFileMutation(ctx, "write_file", mutationID, fingerprint, relPath, absPath, contentBytes, perm, sourceMutationOperation{kind: sourceWrite, projection: prepared})
+	defer commit.finishResponseWait()
 	if writeErr != nil {
 		if errors.Is(writeErr, errMutationNotApplied) {
 			return mcp.NewToolResultError(mutationNotAppliedMessage("write", commit, writeErr)), nil
@@ -1218,10 +1245,15 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("could not write file: %v", writeErr)), nil
 	}
 
+	observeEditSourceReplacement(ctx, priorContent, contentBytes, fileExists, priorContentKnown)
+	observeEditSourceComplete(ctx)
+
 	sess := s.sessionFor(ctx)
 	sess.recordModified(relPath)
 
-	reindexOutcome := s.mutationReindexState(ctx, absPath)
+	admission := s.admitSourceMutations(ctx, absPath)
+	releaseMutation()
+	reindexOutcome := s.awaitSourceMutations(ctx, admission)
 	commit.recordGraph(reindexOutcome)
 
 	resp := map[string]any{
@@ -1237,6 +1269,7 @@ func (s *Server) handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (
 		resp["reindex_error"] = reindexOutcome.Err.Error()
 	}
 	s.attachMutationFreshness(resp, relPath, absPath, reindexOutcome)
+	defer s.beginEditAcknowledgement(ctx, absPath)()
 	if evidenceRequested {
 		s.attachMutationPhysicalEvidence(ctx, resp, absPath, priorContent, fileExists)
 	}
@@ -1374,6 +1407,8 @@ func capReadFileContent(content []byte, maxChars int, binary bool) ([]byte, bool
 	return []byte(strings.ToValidUTF8(string(prefix), "")), true
 }
 
+var errPhysicalFileMoved = errors.New("physical file changed while it was being read; retry")
+
 type physicalReadEvidence struct {
 	resolvedPath    string
 	contentSHA256   string
@@ -1387,19 +1422,28 @@ func samePhysicalFileVersion(a, b os.FileInfo) bool {
 		os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
 
-// readAllSized reads f into a buffer presized from the size the caller already
+// readAllSizedBounded reads f into a buffer presized from the size the caller already
 // observed on the open handle, so the whole-file read costs one allocation
 // instead of io.ReadAll's repeated append-and-copy growth (measured 2.1x the
 // file size in total allocation for a 128 MiB file, 1.0x once presized). The
-// hint is advisory: a file that grew since the stat still reads completely,
-// and an implausible size falls back to unhinted growth.
-func readAllSized(f *os.File, size int64) ([]byte, error) {
+// hint is advisory: growth still reads completely subject to an optional
+// maxBytes bound; exceeding a positive bound returns a budget error. An
+// implausible size falls back to unhinted growth.
+func readAllSizedBounded(f *os.File, size, maxBytes int64) ([]byte, error) {
+	var reader io.Reader = f
+	if maxBytes > 0 {
+		reader = io.LimitReader(f, maxBytes+1)
+		size = min(size, maxBytes)
+	}
 	var buf bytes.Buffer
 	if size > 0 && size < math.MaxInt32 {
 		buf.Grow(int(size) + bytes.MinRead)
 	}
-	if _, err := buf.ReadFrom(f); err != nil {
+	if _, err := buf.ReadFrom(reader); err != nil {
 		return nil, err
+	}
+	if maxBytes > 0 && int64(buf.Len()) > maxBytes {
+		return nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	return buf.Bytes(), nil
 }
@@ -1412,6 +1456,22 @@ func readPhysicalFileEvidence(absPath string) ([]byte, physicalReadEvidence, err
 }
 
 func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBounded(absPath, afterRead, 0)
+}
+
+func readPhysicalFileEvidenceBounded(absPath string, maxBytes int64) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBounded(absPath, nil, maxBytes)
+}
+
+func readPhysicalFileEvidenceObservedBounded(absPath string, afterRead func(), maxBytes int64) ([]byte, physicalReadEvidence, error) {
+	return readPhysicalFileEvidenceObservedBoundedBuffer(absPath, afterRead, maxBytes, nil)
+}
+
+// scratch is request-owned verification workspace, never returned content or
+// cached source authority. Reusing it across a pending-file scan preserves both
+// full reads/hashes and every physical identity check while avoiding one 32KiB
+// io.Copy allocation per file. Existing callers retain their nil-buffer path.
+func readPhysicalFileEvidenceObservedBoundedBuffer(absPath string, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, error) {
 	linkInfo, err := os.Lstat(absPath)
 	if err != nil {
 		return nil, physicalReadEvidence{}, fmt.Errorf("could not inspect physical path: %w", err)
@@ -1429,16 +1489,45 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 	}
 	defer f.Close()
 
+	content, evidence, after, err := readPhysicalEvidenceDescriptor(f, afterRead, maxBytes, scratch)
+	if err != nil {
+		return nil, physicalReadEvidence{}, err
+	}
+	pathInfo, err := os.Stat(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	}
+	resolvedAfter, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
+	}
+	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
+		!samePhysicalFileVersion(after, pathInfo) {
+		return nil, physicalReadEvidence{}, errPhysicalFileMoved
+	}
+
+	evidence.resolvedPath = resolvedAfter
+	evidence.symlinkResolved = linkInfo.Mode()&os.ModeSymlink != 0
+	return content, evidence, nil
+}
+
+// readPhysicalEvidenceDescriptor preserves the same full-buffer read, second
+// streaming hash and descriptor version checks for both physical path readers.
+// Path and parent identity remain the responsibility of their respective caller.
+func readPhysicalEvidenceDescriptor(f *os.File, afterRead func(), maxBytes int64, scratch []byte) ([]byte, physicalReadEvidence, os.FileInfo, error) {
 	before, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not stat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not stat physical file: %w", err)
 	}
 	if !before.Mode().IsRegular() {
-		return nil, physicalReadEvidence{}, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("physical evidence requires a regular file, got %s", before.Mode().Type())
 	}
-	content, err := readAllSized(f, before.Size())
+	if maxBytes > 0 && before.Size() > maxBytes {
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
+	}
+	content, err := readAllSizedBounded(f, before.Size(), maxBytes)
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not read physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not read physical file: %w", err)
 	}
 	sum := sha256.Sum256(content)
 	if afterRead != nil {
@@ -1450,41 +1539,39 @@ func readPhysicalFileEvidenceObserved(absPath string, afterRead func()) ([]byte,
 	// full buffer and detecting in-place same-size rewrites whose mtime was
 	// restored. Metadata-only checks cannot prove that invariant.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not rewind physical file for verification: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not rewind physical file for verification: %w", err)
 	}
 	verificationHash := sha256.New()
-	if _, err := io.Copy(verificationHash, f); err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical file content: %w", err)
+	var verificationReader io.Reader = f
+	if maxBytes > 0 {
+		verificationReader = io.LimitReader(f, maxBytes+1)
+	}
+	if len(scratch) == 0 {
+		scratch = nil
+	}
+	verifiedBytes, err := io.CopyBuffer(verificationHash, verificationReader, scratch)
+	if err != nil {
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not verify physical file content: %w", err)
+	}
+	if maxBytes > 0 && verifiedBytes > maxBytes {
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("%w: byte bound", indexer.ErrSourceSearchBudget)
 	}
 	if !bytes.Equal(sum[:], verificationHash.Sum(nil)) {
-		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
 
 	after, err := f.Stat()
 	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not restat physical file: %w", err)
+		return nil, physicalReadEvidence{}, nil, fmt.Errorf("could not restat physical file: %w", err)
 	}
-	pathInfo, err := os.Stat(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path: %w", err)
+	if !samePhysicalFileVersion(before, after) {
+		return nil, physicalReadEvidence{}, nil, errPhysicalFileMoved
 	}
-	resolvedAfter, err := filepath.EvalSymlinks(absPath)
-	if err != nil {
-		return nil, physicalReadEvidence{}, fmt.Errorf("could not verify physical path resolution: %w", err)
-	}
-	if filepath.Clean(resolvedBefore) != filepath.Clean(resolvedAfter) ||
-		!samePhysicalFileVersion(before, after) ||
-		!samePhysicalFileVersion(after, pathInfo) {
-		return nil, physicalReadEvidence{}, errors.New("physical file changed while it was being read; retry")
-	}
-
 	return content, physicalReadEvidence{
-		resolvedPath:    resolvedAfter,
-		contentSHA256:   fmt.Sprintf("%x", sum),
-		byteCount:       len(content),
-		symlinkResolved: linkInfo.Mode()&os.ModeSymlink != 0,
-		readAt:          time.Now().UTC(),
-	}, nil
+		contentSHA256: hex.EncodeToString(sum[:]),
+		byteCount:     len(content),
+		readAt:        time.Now().UTC(),
+	}, after, nil
 }
 
 func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1508,6 +1595,8 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		return mcp.NewToolResultError(evidenceErr.Error()), nil
 	}
 
+	releaseInteractiveRead := func() {}
+	defer func() { releaseInteractiveRead() }()
 	var (
 		absPath, relPath  string
 		viewURI           string
@@ -1557,15 +1646,28 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 			return mcp.NewToolResultError(guardErr.Error()), nil
 		}
+		sourceView := sourceRequestView(ctx)
+		overlayContent, overlayPresent, overlayDeleted, overlayBaseSHA := s.sourceOverlayFile(ctx, absPath)
+		if sourceView != nil {
+			if !requestViewPathRoot(ctx).contains(absPath) {
+				return mcp.NewToolResultError("source path is outside the selected checkout"), nil
+			}
+			if overlayDeleted {
+				return mcp.NewToolResultError("file is deleted in the current editor buffer"), nil
+			}
+		}
+		if !overlayPresent {
+			releaseInteractiveRead = s.beginEditedFileRead(ctx, absPath)
+		}
 		info, statErr := os.Stat(absPath)
-		if statErr != nil {
+		if statErr != nil && (sourceView == nil || !overlayPresent || physicalEvidenceRequested) {
 			return mcp.NewToolResultError(fmt.Sprintf("could not stat file: %v", statErr)), nil
 		}
-		if info.IsDir() {
+		if info != nil && info.IsDir() {
 			return mcp.NewToolResultError(fmt.Sprintf("path %q is a directory", rawPath)), nil
 		}
 
-		if physicalEvidenceRequested {
+		if physicalEvidenceRequested || (sourceView != nil && info != nil) {
 			var readErr error
 			read := readPhysicalFileEvidence
 			if s.physicalEvidenceOverride != nil {
@@ -1581,6 +1683,9 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			if guardErr := s.guardResolvedPathWithinRepo(ctx, absPath, physicalEvidence.resolvedPath); guardErr != nil {
 				return mcp.NewToolResultError(guardErr.Error()), nil
 			}
+			if sourceView != nil && !requestViewPathRoot(ctx).contains(physicalEvidence.resolvedPath) {
+				return mcp.NewToolResultError("resolved source path is outside the selected checkout"), nil
+			}
 			// Also reject a path retargeted outside after the evidence snapshot.
 			if guardErr := s.guardSymlinkWithinRepo(ctx, absPath); guardErr != nil {
 				return mcp.NewToolResultError(guardErr.Error()), nil
@@ -1591,10 +1696,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 		// drifted overlay is already rejected upstream by the overlay view
 		// guard; what reaches here is a live buffer, which we flag as such so
 		// the caller knows the bytes are an unsaved editor view, not disk.
-		if buf, ok := s.overlayContentFor(ctx, absPath); ok {
+		if sourceView != nil && overlayPresent {
+			if expected := normalizeExpectedSHA(overlayBaseSHA); expected != "" && (info == nil || gitBlobSHA(diskContent) != expected) {
+				return mcp.NewToolResultError("overlay drift: current disk bytes differ from the editor buffer base"), nil
+			}
+			content = []byte(overlayContent)
+			servedFromOverlay = true
+		} else if buf, ok := s.overlayContentFor(ctx, absPath); ok {
 			content = []byte(buf)
 			servedFromOverlay = true
-		} else if physicalEvidenceRequested {
+		} else if physicalEvidenceRequested || sourceRequestView(ctx) != nil {
 			content = diskContent
 		} else {
 			b, rerr := os.ReadFile(absPath)
@@ -1605,12 +1716,16 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			// indexer extracted (#846); the indexer holds symbols from the
 			// decoded file, so serving raw NUL-interleaved bytes makes
 			// discovery and reads disagree.
+			diskContent = b
 			b, utf16Decoded = decodedSourceForRead(b)
 			content = b
 		}
 	}
 
+	releaseInteractiveRead() // before graph/projection queries; this marker covered physical read-back only
+	releaseInteractiveRead = func() {}
 	originalBytes := len(content)
+	sourceHead := content[:min(512, len(content))]
 
 	// Line-window: when offset/limit are given, return only that slice of
 	// the file's lines. This is the bounded-read path for large files — the
@@ -1624,17 +1739,56 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 
 	isBinary := looksBinary(content)
 	bodiesElided := false
+	compressionPending := false
+	compressionBound := false
+	var compressionSymbols []*graph.Node
 	var keptSymbols []string
-	language := s.detectLanguageForPath(ctx, absPath, relPath)
+	var language string
+	if sourceRequestView(ctx) != nil {
+		language = s.detectLanguageForContent(absPath, sourceHead)
+	} else {
+		language = s.detectLanguageForPath(ctx, absPath, relPath)
+	}
+	// Graph-dependent compression must use the same current file as its
+	// source bytes. Ordinary raw reads and unsupported eliders stay untouched.
+	if req.GetBool("compress_bodies", false) && req.GetString("keep", "") != "" && elide.IsSupported(language) && sourceRequestView(ctx) == nil && refViewFilesFor(ctx) == nil && !installedSkillPath(rawPath) {
+		ctx, err = s.ensureProjected(ctx, []string{relPath})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if !servedFromOverlay {
+			var entry *projectionEntry
+			if facts, ok := ctx.Value(requestProjectionFactsKey{}).(*requestProjectionFacts); ok {
+				facts.mu.RLock()
+				entry = facts.entries[pathkey.MutationKey(absPath)]
+				facts.mu.RUnlock()
+				if entry != nil && (!liveProjectionForAcknowledgement(entry) || entry.rawHash != blake3.Sum256(diskContent)) {
+					return mcp.NewToolResultError(errProjectedSourceMoved.Error()), nil
+				}
+			}
+			if entry != nil {
+				compressionSymbols = entry.layer.FileNodes(relPath)
+				compressionBound = true
+			} else {
+				compressionSymbols, compressionBound = s.readFileCompressionSymbols(ctx, absPath, relPath, content)
+			}
+			compressionPending = !compressionBound
+		}
+	}
 	// Tool-call observer: credit the recent search for the symbols in
 	// the file the agent is reading.
-	s.creditFileConsumption(ctx, relPath)
-	// File symbols power both the `keep` predicate and frecency credit.
-	sg := s.engineFor(ctx).GetFileSymbols(relPath)
-	if req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
+	var sg *query.SubGraph
+	if sourceRequestView(ctx) == nil && !compressionPending {
+		afterFreshSymbolAcceptance(ctx, func() { s.creditFileConsumption(ctx, relPath) })
+		sg = s.engineFor(ctx).GetFileSymbols(relPath)
+	}
+	if !compressionPending && req.GetBool("compress_bodies", false) && language != "" && elide.IsSupported(language) {
 		var symbols []*graph.Node
 		if sg != nil {
 			symbols = sg.Nodes
+		}
+		if compressionBound {
+			symbols = compressionSymbols // Never re-query ranges after their proof.
 		}
 		keepPred, resolved := resolveKeepPredicate(req.GetString("keep", ""), symbols)
 		decide := fidelityDecideForPath(fidelityRules, relPath)
@@ -1660,15 +1814,17 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	// credit every defined symbol — keeps the "agent is working in
 	// this area" signal aligned with how the agent burned its
 	// budget.
-	s.sessionFor(ctx).recordFile(relPath)
-	if sg != nil {
-		for _, n := range sg.Nodes {
-			if n == nil || n.Kind == graph.KindFile {
-				continue
+	afterFreshSymbolAcceptance(ctx, func() {
+		s.sessionFor(ctx).recordFile(relPath)
+		if sg != nil {
+			for _, n := range sg.Nodes {
+				if n == nil || n.Kind == graph.KindFile {
+					continue
+				}
+				s.frecency.Record(n.ID)
 			}
-			s.frecency.Record(n.ID)
 		}
-	}
+	})
 
 	// Withhold secret-shaped values from config / data-leaf files unless the
 	// caller explicitly opts out. Keys stay readable; only secret-shaped values
@@ -1699,12 +1855,34 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 	maxChars := req.GetInt("max_chars", 0)
 	content, contentTruncated := capReadFileContent(content, maxChars, isBinary)
 
+	if view := sourceRequestView(ctx); view != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := s.validateSourceCheckoutIdentity(ctx, view); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if view.freshness != nil {
+			view.freshness.fresh = true
+		}
+	}
 	result := map[string]any{
 		"path":           relPath,
 		"language":       language,
 		"bytes":          len(content),
 		"original_bytes": originalBytes,
 		"content":        string(content),
+	}
+	if compressionPending {
+		result["compression_state"] = "pending"
+		result["compression_reason"] = "source_projection_unavailable"
+	}
+	if sourceRequestView(ctx) != nil {
+		source := "disk"
+		if servedFromOverlay {
+			source = "overlay"
+		}
+		result["source_evidence"] = map[string]any{"verified": true, "content_source": source, "byte_count": originalBytes}
 	}
 	if contentTruncated {
 		result["content_truncated"] = true
@@ -1821,11 +1999,15 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 			fullFile = int64(tokens.EstimateFromSample(originalBytes, contentStr))
 		}
 		stats := s.tokenStatsFor(ctx)
-		stats.creditFile(absPath)
-		stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		afterFreshSymbolAcceptance(ctx, func() {
+			stats.creditFile(absPath)
+			stats.record(s.fileAttributionNode(relPath, language), "read_file", returned, fullFile)
+		})
 	}
 
-	s.attachFileDependents(ctx, result, relPath)
+	if sourceRequestView(ctx) == nil {
+		s.attachFileDependents(ctx, result, relPath)
+	}
 
 	if s.isTOON(ctx, req) {
 		return returnTOON(result)
@@ -1839,12 +2021,44 @@ func (s *Server) handleReadFile(ctx context.Context, req mcp.CallToolRequest) (*
 // Registry's extension-based detection so unindexed files (or files
 // outside any tracked repo) still get a language tag.
 func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath string) string {
-	// Try the indexed file node first.
-	if sg := s.engineFor(ctx).GetFileSymbols(relPath); sg != nil {
-		for _, n := range sg.Nodes {
-			if n != nil && n.Kind == graph.KindFile && n.Language != "" {
-				return n.Language
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return ""
+	}
+	// File nodes use the graph path as their canonical identity, including
+	// the repo prefix. Language attribution needs that one selected node,
+	// never the file's declarations or adjacency. Legacy custom identities
+	// use the bounded registry/content fallback below.
+	// Source-only reads still bypass graph evidence entirely.
+	if sourceRequestView(ctx) == nil {
+		reader := s.readerFor(ctx)
+		var node *graph.Node
+		var err error
+		switch checked := reader.(type) {
+		case interface {
+			GetNodeContext(context.Context, string) (*graph.Node, error)
+		}:
+			node, err = checked.GetNodeContext(ctx, relPath)
+		case interface {
+			GetNodesByIDsContext(context.Context, []string) (map[string]*graph.Node, error)
+		}:
+			var nodes map[string]*graph.Node
+			nodes, err = checked.GetNodesByIDsContext(ctx, []string{relPath})
+			node = nodes[relPath]
+		default:
+			if reader != nil {
+				node = reader.GetNode(relPath)
 			}
+		}
+		if ctx.Err() != nil {
+			return ""
+		}
+		// Attribution is best effort, including after a committed operation:
+		// a failed checked read uses the registry, never a late tool refusal.
+		if err == nil && node != nil && node.ID == relPath && node.Kind == graph.KindFile && node.FilePath == relPath && node.Language != "" && s.nodeInSessionScope(ctx, node) {
+			return node.Language
 		}
 	}
 	// Fall back to the parser registry from whichever indexer owns
@@ -1861,6 +2075,10 @@ func (s *Server) detectLanguageForPath(ctx context.Context, absPath, relPath str
 		}
 		_ = f.Close()
 	}
+	return s.detectLanguageForContent(absPath, head)
+}
+
+func (s *Server) detectLanguageForContent(absPath string, head []byte) string {
 	if s.multiIndexer != nil {
 		for _, prefix := range s.multiIndexer.RepoPrefixes() {
 			if idx := s.multiIndexer.GetIndexer(prefix); idx != nil {

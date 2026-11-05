@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/zzet/gortex/internal/agents"
 	"github.com/zzet/gortex/internal/daemon"
 	"github.com/zzet/gortex/internal/indexer"
 	gortexmcp "github.com/zzet/gortex/internal/mcp"
@@ -44,6 +46,11 @@ type mcpDispatcher struct {
 	// diagnostic has already been emitted, so it fires once per session
 	// rather than on every frame. Cleared in SessionEnded.
 	loggedUntracked sync.Map
+	// loadingSessions maps a session ID to the repository its initialize
+	// reported as loading, so that session is told once the repository is
+	// ready. Instructions cannot be refreshed after initialize; the message is
+	// the only in-session signal. Cleared on notify and in SessionEnded.
+	loadingSessions sync.Map
 }
 
 func newMCPDispatcher(srv *gortexmcp.Server, mi *indexer.MultiIndexer, logger *zap.Logger) *mcpDispatcher {
@@ -66,6 +73,16 @@ func (d *mcpDispatcher) SetRouter(r *daemon.Router) { d.router.Store(r) }
 // HTTP-side Streamable transport can share the same router instance
 // without rebuilding it from servers.toml a second time.
 func (d *mcpDispatcher) Router() *daemon.Router { return d.router.Load() }
+
+// DispatchClass lowers facade calls through the same immutable registry used
+// by execution, before either daemon transport acquires admission capacity.
+func (d *mcpDispatcher) DispatchClass(name string, arguments map[string]any) daemon.MCPDispatchClass {
+	if d.srv == nil {
+		class, _ := daemon.ToolDispatchClass(name)
+		return class
+	}
+	return d.srv.DispatchClass(name, arguments)
+}
 
 // Dispatch implements daemon.MCPDispatcher. It hands the raw JSON-RPC
 // frame to MCPServer.HandleMessage and returns the response bytes.
@@ -93,9 +110,11 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// tools/call — that's the frame that needs the graph. initialize and
 	// tools/list flow through so the MCP handshake SURVIVES an untracked cwd:
 	// initialize returns the inactive-instructions variant (run `gortex track`)
-	// and tools/list answers an empty/track-only list, instead of a
-	// connection-poisoning errored initialize. Only tools/call is refused (with
-	// the structured not-tracked error the agent can act on).
+	// and tools/list keeps the full list (see rewriteUntrackedResponse),
+	// instead of a connection-poisoning errored initialize. Only tools/call is
+	// refused (with the structured not-tracked error the agent can act on).
+	// A cwd in a configured repository that is not registered yet is not
+	// untracked: see pendingRepoRefusal.
 	// Discovery needs the calling CWD for its scope authorization, but binding
 	// a client session must wait until admission has succeeded.
 	ctx = gortexmcp.WithSessionID(ctx, sess.ID)
@@ -105,9 +124,30 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// carried a clientInfo.name.
 	ctx = gortexmcp.WithClientConnection(ctx)
 	reachable, admissionErr := d.cwdReachableChecked(ctx, sess.CWD)
-	untracked := sess.CWD != "" && !reachable && admissionErr == nil
+	// A configured repository the registry does not hold yet is neither
+	// tracked nor untracked: it is loading, or its load ended without
+	// registering it. It gets its own answers below, never the untracked
+	// "run gortex track" ones.
+	var pending *repoPendingAdmission
+	if errors.As(admissionErr, &pending) {
+		admissionErr = nil
+	}
+	var terminalFamilyLoad []indexer.RepoLoad
+	if pending != nil && pending.load.State.Unavailable() && agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
+		terminalFamilyLoad = []indexer.RepoLoad{pending.load}
+		pending = nil // still unadmitted; only the guidance/refusal classification changes
+	}
+	untracked := sess.CWD != "" && !reachable && admissionErr == nil && pending == nil
 	if admissionErr != nil && !checkoutAdmissionMetadataMethod(peekFrameMethod(frame)) {
 		return checkoutAdmissionError(sess.CWD, frame, admissionErr), nil
+	}
+	if sess.CWD != "" && !reachable && admissionErr == nil && d.bootstrapTracksOwnFamilyRoot(sess.CWD, frame) {
+		return d.familyDiscoveryRefusal(sess.CWD, frame, "family_member"), nil
+	}
+	if pending != nil {
+		if refused := d.pendingRepoRefusal(sess, frame, pending); refused != nil {
+			return refused, nil
+		}
 	}
 	if untracked {
 		d.logUncoveredCWDOnce(sess)
@@ -148,7 +188,10 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 	// frames (initialize, tools/list, notifications) flow through
 	// the local MCPServer below; routing them across a federation
 	// would change semantics that are intentionally machine-local.
-	if d.router.Load() != nil {
+	// A session in a repository that is still loading is local by definition:
+	// the router must not hand its admitted calls to whatever server a
+	// workspace roster names.
+	if d.router.Load() != nil && pending == nil {
 		if proxied, ok := d.tryProxyToolCall(ctx, sess, frame); ok {
 			return proxied, nil
 		}
@@ -193,14 +236,20 @@ func (d *mcpDispatcher) Dispatch(ctx context.Context, sess *daemon.Session, fram
 			zap.String("session_id", sess.ID), zap.Error(err))
 		return nil, fmt.Errorf("marshal reply: %w", err)
 	}
-	// For an untracked cwd, rewrite the surviving initialize / tools/list
-	// response into its inactive variant: the agent gets the actionable
-	// "run gortex track" instructions and an empty track-only tool list.
+	// For an untracked cwd, rewrite the surviving initialize response into
+	// its inactive variant: the agent gets the actionable "run gortex track"
+	// instructions. tools/list is left whole.
 	if untracked {
-		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD, d.trackedRoots())
+		out = rewriteUntrackedResponse(peekFrameMethod(frame), out, sess.CWD, d.familyRoots(), terminalFamilyLoad...)
 	}
 	if admissionErr != nil {
 		out = rewriteCheckoutAdmissionResponse(peekFrameMethod(frame), out, sess.CWD, admissionErr)
+	}
+	if pending != nil && pending.familyInstructions != "" {
+		out = rewriteMCPAdmissionInstructions(peekFrameMethod(frame), out, pending.familyInstructions)
+	}
+	if pending != nil {
+		d.notePendingRepoSession(sess, peekFrameMethod(frame), pending.load)
 	}
 	return out, nil
 }
@@ -263,7 +312,7 @@ func untrackedBootstrapCall(frame []byte) bool {
 // untracked-cwd variant. tools/list is deliberately preserved so facade clients
 // can discover capabilities and workspace_admin.track without reconnecting;
 // every other tools/call remains blocked by Dispatch until tracking succeeds.
-func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []string) []byte {
+func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []string, terminalLoad ...indexer.RepoLoad) []byte {
 	if len(out) == 0 {
 		return out
 	}
@@ -278,7 +327,15 @@ func rewriteUntrackedResponse(method string, out []byte, cwd string, roots []str
 	if method != "initialize" && method != "server/discover" {
 		return out
 	}
-	result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
+	if agents.PendingAutomaticCheckout(cwd, roots) {
+		if len(terminalLoad) > 0 {
+			result["instructions"] = gortexmcp.ServerInstructionsPendingFamilyLoad(cwd, terminalLoad[0], roots...)
+		} else {
+			result["instructions"] = gortexmcp.ServerInstructionsPendingAutomaticCheckout(cwd, roots...)
+		}
+	} else {
+		result["instructions"] = gortexmcp.ServerInstructionsUntracked(cwd, roots...)
+	}
 	resp["result"] = result
 	if rewritten, mErr := json.Marshal(resp); mErr == nil {
 		return rewritten
@@ -315,6 +372,7 @@ func (d *mcpDispatcher) SessionEnded(sess *daemon.Session) {
 		d.srv.ReleaseSession(sess.ID)
 	}
 	d.loggedUntracked.Delete(sess.ID)
+	d.loadingSessions.Delete(sess.ID)
 }
 
 // cwdReachable reports whether a session cwd has any chance of
@@ -356,23 +414,7 @@ func checkoutAdmissionMetadataMethod(method string) bool {
 }
 
 func checkoutAdmissionFailure(err error) (code string, retryable bool) {
-	var committed interface{ Committed() bool }
-	if errors.As(err, &committed) && committed.Committed() {
-		return "checkout_inaccessible", false
-	}
-	if errors.Is(err, indexer.ErrCheckoutMutationBusy) || errors.Is(err, context.DeadlineExceeded) {
-		return "view_building", true
-	}
-	// Catalog readers can surface SQLite contention directly, including an
-	// extended result code. Only BUSY/LOCKED are safe retry classifications.
-	var coded interface{ Code() int }
-	if errors.As(err, &coded) {
-		switch coded.Code() & 0xff {
-		case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
-			return "view_building", true
-		}
-	}
-	return "checkout_inaccessible", false
+	return gortexmcp.CheckoutAdmissionFailure(err)
 }
 
 func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
@@ -381,23 +423,33 @@ func checkoutAdmissionError(cwd string, inbound []byte, err error) []byte {
 	}
 	_ = json.Unmarshal(inbound, &req)
 	code, retryable := checkoutAdmissionFailure(err)
+	data := map[string]any{"error_code": code, "path": cwd, "retryable": retryable}
+	// A pending discovery names the checkout root it applies to, so a caller
+	// can tell one pending worktree from an unavailable daemon.
+	var pending *indexer.CheckoutDiscoveryPendingError
+	if errors.As(err, &pending) {
+		data["family"], data["reason"], data["state"] = pending.Family, pending.Reason, "discovery_pending"
+		if pending.Root != "" {
+			data["path"] = pending.Root
+		}
+	}
 	out, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      req.ID,
 		"error": map[string]any{
 			"code":    -32000,
 			"message": "checkout discovery unavailable: " + err.Error(),
-			"data": map[string]any{
-				"error_code": code,
-				"path":       cwd,
-				"retryable":  retryable,
-			},
+			"data":    data,
 		},
 	})
 	return out
 }
 
 func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err error) []byte {
+	return rewriteMCPAdmissionInstructions(method, out, gortexmcp.CheckoutAdmissionInstructions(cwd, err))
+}
+
+func rewriteMCPAdmissionInstructions(method string, out []byte, instructions string) []byte {
 	if method != "initialize" && method != "server/discover" {
 		return out
 	}
@@ -409,11 +461,7 @@ func rewriteCheckoutAdmissionResponse(method string, out []byte, cwd string, err
 	if !ok {
 		return out
 	}
-	code, retryable := checkoutAdmissionFailure(err)
-	result["instructions"] = fmt.Sprintf(
-		"Gortex checkout discovery is unavailable for %s (%s, retryable=%t): %v. "+
-			"No graph access has been granted. Retry after discovery can complete; do not change tracking configuration to resolve this admission error.",
-		cwd, code, retryable, err)
+	result["instructions"] = instructions
 	updated, marshalErr := json.Marshal(reply)
 	if marshalErr != nil {
 		return out
@@ -425,7 +473,7 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 	if cwd == "" {
 		return true, nil
 	}
-	if d.isCWDTracked(cwd) {
+	if d.registeredCWDReachable(cwd) {
 		return true, nil
 	}
 	// Workspace-root fallback: a cwd that CONTAINS tracked repos — an
@@ -443,11 +491,13 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 	// left the session with no working call and a remedy (`gortex track
 	// <parent>`) that would have indexed every child a second time.
 	if d.multiIndexer != nil {
-		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
-			return true, nil
-		}
-		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
-			return true, nil
+		// Configured but not registered yet: warmup has not reached the
+		// repository, or its load ended without registering it. Decided
+		// before the checkout and router arms, so a worktree of a loading
+		// primary is not told to reconcile and a loading cwd never takes the
+		// router's path. Lock-free; reads no store.
+		if rec, pending := d.multiIndexer.PendingRepoForPath(cwd); pending {
+			return false, &repoPendingAdmission{load: rec}
 		}
 	}
 	// Checkout fallback: a git worktree of a tracked family is a directory
@@ -466,16 +516,59 @@ func (d *mcpDispatcher) cwdReachableChecked(ctx context.Context, cwd string) (bo
 			return err == nil && reachable, err
 		}
 	}
-	rtr := d.router.Load()
-	if rtr == nil {
-		return false, nil
+	if rtr := d.router.Load(); rtr != nil {
+		lookup := rtr.LookupForCwd(cwd, "")
+		switch lookup.Source {
+		case "scope-override", "config-yaml", "roster":
+			return true, nil
+		}
 	}
-	lookup := rtr.LookupForCwd(cwd, "")
-	switch lookup.Source {
-	case "scope-override", "config-yaml", "roster":
-		return true, nil
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if d.multiIndexer != nil {
+		if rec, classified := d.multiIndexer.RepoLoadAdmissionForPath(cwd); classified {
+			if rec.State.Ready() {
+				// Registration can publish during the probes above. The load table is
+				// identity evidence, not graph authority: recheck ordinary scope once.
+				if d.registeredCWDReachable(cwd) {
+					return true, nil
+				}
+				if probe != nil {
+					reachable, err := probe(ctx, cwd)
+					if err != nil || reachable {
+						return err == nil && reachable, err
+					}
+				}
+				if instructions, known := gortexmcp.PendingAutomaticCheckoutInstructions(cwd, d.familyRoots()...); known {
+					return false, &repoPendingAdmission{load: rec, familyInstructions: instructions}
+				}
+				rec = indexer.RepoLoad{State: indexer.RepoLoadIdentityPending, Reason: "scope_binding_pending"}
+			}
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			return false, &repoPendingAdmission{load: rec}
+		}
 	}
 	return false, nil
+}
+
+// registeredCWDReachable is the existing registry/scope positive authority,
+// also rechecked when registration races a negative checkout probe.
+func (d *mcpDispatcher) registeredCWDReachable(cwd string) bool {
+	if d.isCWDTracked(cwd) {
+		return true
+	}
+	if d.multiIndexer != nil {
+		if _, _, _, ok := d.multiIndexer.ScopeForCWD(cwd); ok {
+			return true
+		}
+		if _, _, ok := d.multiIndexer.ContainedReposScope(cwd); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // isCWDTracked reports whether the proxy's cwd lies inside any tracked
@@ -536,6 +629,56 @@ func (d *mcpDispatcher) trackedRoots() []string {
 	}
 	sort.Strings(roots)
 	return roots
+}
+
+func (d *mcpDispatcher) familyRoots() []string {
+	return agents.FamilyRepoRoots(d.trackedRoots(), d.multiIndexer.ConfiguredRepoRoots())
+}
+
+func (d *mcpDispatcher) bootstrapTracksOwnFamilyRoot(cwd string, frame []byte) bool {
+	target, track := gortexmcp.BootstrapTrackPath(frame)
+	if !track {
+		return false
+	}
+	root, family := agents.AutomaticCheckoutFamily(cwd, d.familyRoots())
+	if family == "" {
+		return false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(cwd, target)
+	}
+	return pathkey.SamePathIdentity(pathkey.CanonicalExistingRoot(target), pathkey.CanonicalExistingRoot(root))
+}
+
+func (d *mcpDispatcher) familyDiscoveryRefusal(cwd string, inbound []byte, reason string) []byte {
+	if load, pending := d.multiIndexer.PendingRepoForPath(cwd); pending && !load.State.Loading() {
+		return familyDiscoveryError(cwd, inbound, reason, load)
+	}
+	return familyDiscoveryError(cwd, inbound, reason)
+}
+
+func familyDiscoveryError(cwd string, inbound []byte, reason string, terminalLoad ...indexer.RepoLoad) []byte {
+	var request struct {
+		ID json.RawMessage `json:"id"`
+	}
+	_ = json.Unmarshal(inbound, &request)
+	data := map[string]any{
+		"error_code": "view_building", "retryable": true, "path": cwd,
+		"state": "discovery_pending", "reason": reason,
+		"suggestion": fmt.Sprintf("Retry graph calls; no reconnect is needed. Inspect `gortex repos explain-view %s` for discovery details.", cwd),
+	}
+	if len(terminalLoad) > 0 {
+		data["load_state"], data["load_reason"], data["repo_path"] = terminalLoad[0].State, terminalLoad[0].Reason, terminalLoad[0].Root
+	}
+	out, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": request.ID,
+		"error": map[string]any{
+			"code":    -32000,
+			"message": "Git family checkout discovery is pending; retry graph calls without changing tracking configuration.",
+			"data":    data,
+		},
+	})
+	return out
 }
 
 // tryProxyToolCall inspects a JSON-RPC frame and, if it's a
@@ -695,6 +838,9 @@ func (d *mcpDispatcher) maybeSnoopInitialize(sess *daemon.Session, frame []byte)
 // (error_code, path, suggestion) so a tool UI can offer a one-click
 // "track this repo" button without regex-parsing the message string.
 func (d *mcpDispatcher) notTrackedError(sess *daemon.Session, inbound []byte) []byte {
+	if agents.PendingAutomaticCheckout(sess.CWD, d.familyRoots()) {
+		return d.familyDiscoveryRefusal(sess.CWD, inbound, "family_pending")
+	}
 	// Pull the request id out of the inbound frame so the response
 	// pairs correctly. If parsing fails (malformed frame), send a
 	// null id — JSON-RPC clients treat that as "error with no
@@ -705,16 +851,19 @@ func (d *mcpDispatcher) notTrackedError(sess *daemon.Session, inbound []byte) []
 	}
 	_ = json.Unmarshal(inbound, &peek)
 
+	// Tool arguments cannot change session admission. Point callers to an
+	// explicit listing instead of enumerating unrelated repositories per error.
+	const recovery = "Use `gortex repos` to list tracked repositories, then reconnect MCP with its working directory inside the intended repository."
 	resp := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      peek.ID,
 		"error": map[string]any{
 			"code":    -32000,
-			"message": fmt.Sprintf("repository not tracked: %s", sess.CWD),
+			"message": fmt.Sprintf("repository not tracked: %s. %s", sess.CWD, recovery),
 			"data": map[string]any{
 				"error_code": "repo_not_tracked",
 				"path":       sess.CWD,
-				"suggestion": fmt.Sprintf("Run `gortex track %s` to include this repo in the shared graph.", sess.CWD),
+				"suggestion": fmt.Sprintf("%s Alternatively, run `gortex track %s` to include this repo in the shared graph.", recovery, sess.CWD),
 			},
 		},
 	}

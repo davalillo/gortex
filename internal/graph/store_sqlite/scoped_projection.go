@@ -1,7 +1,10 @@
 package store_sqlite
 
 import (
+	"encoding/json"
 	"iter"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/zzet/gortex/internal/graph"
@@ -82,6 +85,91 @@ func (s *Store) NodesLightInScopeSeq(repoPrefixes, filePaths []string) iter.Seq[
 	}
 }
 
+// NodesLightByKindsInScopeSeq preserves the full scoped cursor's kind and
+// placement predicates while excluding retrieval payloads from each row.
+func (s *Store) NodesLightByKindsInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph.NodeKind) iter.Seq[*graph.Node] {
+	kindValues, ok := scopedKindValues(kinds)
+	if !ok {
+		return func(func(*graph.Node) bool) {}
+	}
+	return func(yield func(*graph.Node) bool) {
+		for _, kind := range kindValues {
+			query, args, ok := scopedNodeProjectionQuery(repoPrefixes, filePaths, kind, lookupNodeSummaryCols, s.viewGen)
+			if !ok || !s.streamScopedNodes(query, args, true, yield) {
+				return
+			}
+		}
+	}
+}
+
+// fileLocationCensusCap bounds the rows one file-location read holds in
+// memory. nodes_repo_files walks repository, workspace, language and path, so
+// its rows are sorted into ID order after the cursor closes; a larger census
+// keeps the paged summary cursor instead. A variable so tests can lower it.
+var fileLocationCensusCap = 1 << 16
+
+// fileLocationProjectionSQL reads file locations from the covering partial
+// index alone. The kind is a literal so the planner can prove the index's
+// predicate. The index key plus the WITHOUT ROWID primary key (id, view_gen)
+// supply every selected column and the generation, so no wide nodes row (and
+// none of its overflow pages) is read. Without the index the statement fails
+// to prepare and the caller falls back.
+const fileLocationProjectionSQL = `SELECT n.id, n.file_path, n.language, n.repo_prefix, n.workspace_id` +
+	` FROM nodes AS n INDEXED BY nodes_repo_files` +
+	` WHERE n.kind = 'file' AND n.repo_prefix IN (SELECT CAST(value AS TEXT) FROM json_each(?))` +
+	` AND n.view_gen = ? LIMIT ?`
+
+// FileLocationsInScopeSeq yields the rows NodesLightByKindsInScopeSeq would
+// for KindFile, in the same ascending ID order, with only the location
+// columns populated. One statement serves the whole census and its cursor is
+// closed before the first yield. A census above fileLocationCensusCap, or a
+// read the covering index cannot serve, falls back to the summary cursor.
+func (s *Store) FileLocationsInScopeSeq(repoPrefixes []string) iter.Seq[*graph.Node] {
+	return func(yield func(*graph.Node) bool) {
+		nodes, ok := s.readFileLocations(repoPrefixes)
+		if !ok {
+			s.NodesLightByKindsInScopeSeq(repoPrefixes, nil, graph.KindFile)(yield)
+			return
+		}
+		for _, node := range nodes {
+			if !yield(node) {
+				return
+			}
+		}
+	}
+}
+
+// readFileLocations reports false when the census must come from the summary
+// cursor: the statement failed, or more than fileLocationCensusCap rows match.
+func (s *Store) readFileLocations(repoPrefixes []string) ([]*graph.Node, bool) {
+	reposJSON, ok := projectionJSON(repoPrefixes)
+	if !ok {
+		return nil, true
+	}
+	limit := fileLocationCensusCap
+	rows, err := s.db.Query(fileLocationProjectionSQL, reposJSON, s.viewGen, limit+1)
+	if err != nil {
+		return nil, false
+	}
+	nodes := make([]*graph.Node, 0, 64)
+	for rows.Next() {
+		node := &graph.Node{Kind: graph.KindFile}
+		if err := rows.Scan(&node.ID, &node.FilePath, &node.Language, &node.RepoPrefix, &node.WorkspaceID); err != nil {
+			_ = rows.Close()
+			return nil, false
+		}
+		nodes = append(nodes, node)
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil || len(nodes) > limit {
+		return nil, false
+	}
+	// strings.Compare is SQLite's BINARY collation, the summary cursor's order.
+	slices.SortFunc(nodes, func(a, b *graph.Node) int { return strings.Compare(a.ID, b.ID) })
+	return nodes, true
+}
+
 // streamScopedNodes drains one node cursor page by page. It reports false when
 // the consumer stopped the sequence, true when the cursor is exhausted.
 func (s *Store) streamScopedNodes(query string, args []any, summary bool, yield func(*graph.Node) bool) bool {
@@ -143,8 +231,8 @@ func (s *Store) EdgesInScopeSeq(repoPrefixes, filePaths []string, kinds ...graph
 		return func(func(graph.ScopedEdgeRow) bool) {}
 	}
 	return func(yield func(graph.ScopedEdgeRow) bool) {
-		var maxID int64
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM edges WHERE view_gen = ?`, s.viewGen).Scan(&maxID); err != nil {
+		maxID, err := s.edgeGenerationHighWater()
+		if err != nil {
 			panicOnFatal(err)
 			return
 		}
@@ -255,6 +343,29 @@ func scopedNodeProjectionQuery(
 	if !haveRepos && !haveFiles {
 		return "", nil, false
 	}
+	if haveRepos && !haveFiles && kind != "" && len(repoPrefixes) == 1 && repoPrefixes[0] != "" {
+		generationColumn := "n.view_gen"
+		if viewGen == baseViewGeneration && (kind == string(graph.KindFile) || kind == string(graph.KindContract)) {
+			// The base repository contains many ordinary symbols beside its
+			// sparse file/contract kinds. Keep generation equality exact but
+			// drive this cursor from the existing repo/kind keyset index.
+			generationColumn = "+n.view_gen"
+		}
+		query := `SELECT ` + qualifiedNodeColumns("n", columns) +
+			` FROM nodes AS n` +
+			` WHERE n.repo_prefix = ? AND n.kind = ? AND ` + generationColumn + ` = ?` +
+			` AND n.id > ? ORDER BY n.id LIMIT ?`
+		return query, []any{repoPrefixes[0], kind, viewGen}, true
+	}
+	// FindFiles admits unowned rows beside a selected repository. A global
+	// file-kind cursor still visits every repository before applying that
+	// filter. Bound each repo-first arm, then merge in the same global ID
+	// order. Positive generations and broader frontiers keep their old SQL.
+	if haveRepos && !haveFiles && viewGen == baseViewGeneration && kind == string(graph.KindFile) {
+		if query, args, ok := scopedBaseFileRepoUnionQuery(reposJSON, columns, kind, viewGen); ok {
+			return query, args, true
+		}
+	}
 	ctes := make([]string, 0, 2)
 	joins := make([]string, 0, 2)
 	args := make([]any, 0, 3)
@@ -286,6 +397,35 @@ func scopedNodeProjectionQuery(
 		` FROM nodes AS n ` + strings.Join(joins, " ") +
 		` WHERE ` + kindPredicate + `n.view_gen = ? AND n.id > ? ORDER BY n.id LIMIT ?`
 	return query, args, true
+}
+
+// At most sixteen repo-first arms keep SQL size/parameter count and the
+// intermediate rows bounded. The pager still appends one cursor and limit.
+const scopedBaseFileRepoUnionArms = 16
+
+func scopedBaseFileRepoUnionQuery(reposJSON, columns, kind string, viewGen int64) (string, []any, bool) {
+	var repos []string
+	if err := json.Unmarshal([]byte(reposJSON), &repos); err != nil || len(repos) < 2 || len(repos) > scopedBaseFileRepoUnionArms {
+		return "", nil, false
+	}
+	parameter := func(index int) string { return "?" + strconv.Itoa(index) }
+	kindParam, generationParam := parameter(len(repos)+1), parameter(len(repos)+2)
+	cursorParam, limitParam := parameter(len(repos)+3), parameter(len(repos)+4)
+	ctes := make([]string, 0, len(repos))
+	arms := make([]string, 0, len(repos))
+	args := make([]any, 0, len(repos)+2)
+	for i, repo := range repos {
+		name := "repo_" + strconv.Itoa(i)
+		ctes = append(ctes, name+` AS (SELECT `+qualifiedNodeColumns("n", columns)+
+			` FROM nodes AS n WHERE n.repo_prefix = `+parameter(i+1)+
+			` AND n.kind = `+kindParam+` AND +n.view_gen = `+generationParam+
+			` AND n.id > `+cursorParam+` ORDER BY n.id LIMIT `+limitParam+`)`)
+		arms = append(arms, `SELECT * FROM `+name)
+		args = append(args, repo)
+	}
+	args = append(args, kind, viewGen)
+	return `WITH ` + strings.Join(ctes, ", ") + ` ` + strings.Join(arms, ` UNION ALL `) +
+		` ORDER BY id LIMIT ` + limitParam, args, true
 }
 
 // scopedEdgeProjectionQuery is the canonical exact-file path. The requested
@@ -416,3 +556,5 @@ func (s *Store) scopedEdgeFileProvenanceCanonical(
 }
 
 var _ graph.ScopedProjectionSequencer = (*Store)(nil)
+var _ graph.ScopedKindSummarySequencer = (*Store)(nil)
+var _ graph.ScopedFileLocationSequencer = (*Store)(nil)

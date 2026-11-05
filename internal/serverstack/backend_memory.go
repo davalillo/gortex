@@ -39,7 +39,7 @@ func memoryJournalPath(snapshotPath string) string {
 // openMemoryBackend builds the memory-resident backend: cold start loads the
 // sqlite snapshot (if any), replays the journal on top, and returns a store
 // whose close dumps a fresh snapshot and resets the journal.
-func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (store graph.Store, closeFn func(), err error) {
+func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...store_sqlite.MigrationObserver) (store graph.Store, closeFn func() error, err error) {
 	// 0. The in-RAM FTS engine (issue #21). Derived state: not journaled,
 	// not persisted; rebuilt from resident graph state by the warmup FTS
 	// step and closed with the backend.
@@ -72,7 +72,7 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 	// davalillo/gortex#25 A7).
 	if _, err := os.Stat(snapshotPath); err == nil {
 		var snap graph.Store
-		var closeSnap func()
+		var closeSnap func() error
 		snap, closeSnap, err = openSqliteBackend(snapshotPath, false, observers...)
 		if err != nil {
 			err = fmt.Errorf("memory backend: open snapshot: %w", err)
@@ -82,7 +82,9 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 		// still runs under the store's write lock (issue #25 A8).
 		mstore.ColdLoadBatch(snap.AllNodes(), snap.AllEdges())
 		restoreFileMtimes(mstore, snap)
-		closeSnap()
+		if cerr := closeSnap(); cerr != nil && logger != nil {
+			logger.Warn("memory backend: snapshot close after cold load", zap.Error(cerr))
+		}
 	}
 
 	// 2. Replay the journal on top of the snapshot (or onto the empty graph).
@@ -197,16 +199,26 @@ func openMemoryBackend(snapshotPath string, logger *zap.Logger, observers ...sto
 		}
 	}()
 
-	closeFn = func() {
+	closeFn = func() error {
 		stopOnce.Do(func() { close(stopped) })
 		dumpMu.Lock()
 		snapshotAndRotate("close")
-		if err := mstore.CloseJournal(); err != nil && logger != nil {
-			logger.Warn("memory backend: journal close", zap.Error(err))
+		var closeErr error
+		if err := mstore.CloseJournal(); err != nil {
+			closeErr = err
+			if logger != nil {
+				logger.Warn("memory backend: journal close", zap.Error(err))
+			}
 		}
-		if err := engine.Close(); err != nil && logger != nil {
-			logger.Warn("memory backend: fts engine close", zap.Error(err))
+		if err := engine.Close(); err != nil {
+			if closeErr == nil {
+				closeErr = err
+			}
+			if logger != nil {
+				logger.Warn("memory backend: fts engine close", zap.Error(err))
+			}
 		}
+		return closeErr
 	}
 	return mstore, closeFn, nil
 }
@@ -240,7 +252,7 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	snap.AddBatch(store.AllNodes(), store.AllEdges())
 	if hasBulk {
 		if err := bl.FlushBulk(); err != nil {
-			closeSnap()
+			_ = closeSnap()
 			return fmt.Errorf("memory backend: snapshot bulk flush: %w", err)
 		}
 	}
@@ -255,12 +267,26 @@ func snapshotMemoryStore(store *graph.MemoryStore, snapshotPath string) error {
 	if hasReplace {
 		for _, prefix := range store.FileMtimePrefixes() {
 			if err := replacer.ReplaceFileMtimes(prefix, store.LoadFileMtimes(prefix)); err != nil {
-				closeSnap()
+				_ = closeSnap()
 				return fmt.Errorf("memory backend: snapshot mtimes for %q: %w", prefix, err)
 			}
 		}
 	}
-	closeSnap()
+	// Upstream's default close-checkpoint policy is `skip`: Close() leaves
+	// committed rows in the -wal sidecar, and the rename-based publish below
+	// moves only the main DB file. Checkpoint explicitly so the renamed
+	// snapshot is self-contained — otherwise the stranded WAL silently drops
+	// rows (observed: file_mtimes empty after publish, forcing a full
+	// re-reconcile on the next warm boot).
+	if cp, ok := snap.(interface{ CheckpointWAL() error }); ok {
+		if err := cp.CheckpointWAL(); err != nil {
+			_ = closeSnap()
+			return fmt.Errorf("memory backend: checkpoint snapshot target: %w", err)
+		}
+	}
+	if err := closeSnap(); err != nil {
+		return fmt.Errorf("memory backend: close snapshot target: %w", err)
+	}
 	if err := os.Rename(tmp, snapshotPath); err != nil {
 		return fmt.Errorf("memory backend: publish snapshot: %w", err)
 	}

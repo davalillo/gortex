@@ -327,7 +327,7 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 				true, eerr
 		}
 		if eerr != nil {
-			return nil, false, eerr
+			return nil, false, contractContentFailure(eerr)
 		}
 		stampParseErrors(r)
 		normalizeExtractionMetadata(r, src)
@@ -360,13 +360,16 @@ func (idx *Indexer) extractFileCtxWithRawLease(
 		return quarantineResult(relPath, lang, res.Err), true,
 			fmt.Errorf("parser crash isolated on %s: %s", relPath, res.Err)
 	case res.Err != "":
-		return nil, false, errors.New(res.Err)
+		return nil, false, contractContentFailure(errors.New(res.Err))
 	}
 
 	// Clean parse: if the file was quarantined under an older revision
 	// and has since been fixed, drop the stale entry.
 	q.Forget(relPath)
 	result = &parser.ExtractionResult{Nodes: res.Nodes, Edges: res.Edges}
+	if res.ParseChecked && res.ParseErrors >= 0 {
+		result.ParseChecked, result.ParseErrors = true, res.ParseErrors
+	}
 	if res.HasParseErr {
 		stampParseErrorCount(result.Nodes, res.ParseErrors)
 	}

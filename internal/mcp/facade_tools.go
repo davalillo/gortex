@@ -520,10 +520,9 @@ func parseLocalizationNewUserBoundary(facade, operation string, arguments map[st
 	return boundary, nil
 }
 
-func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-	started := time.Now()
-	input, _ := req.Params.Arguments.(map[string]any)
-	localizationAuthToken := localizationauth.TakeArgument(input)
+// facadeRequestOperation is the side-effect-free operation selection shared
+// by admission classification and the actual facade dispatcher.
+func facadeRequestOperation(facade string, req mcpgo.CallToolRequest) string {
 	operation := resolveFacadeOperationAlias(facade, normalizeFacadeOperation(req.GetString("operation", "")))
 	if facade == "analyze" {
 		operation = requestedAnalyzeKind(req.GetArguments())
@@ -540,6 +539,14 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 	if facade == "read" {
 		operation = normalizeFacadeReadOperation(operation, req.GetArguments())
 	}
+	return operation
+}
+
+func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+	started := time.Now()
+	input, _ := req.Params.Arguments.(map[string]any)
+	localizationAuthToken := localizationauth.TakeArgument(input)
+	operation := facadeRequestOperation(facade, req)
 	terminal := s.localizationFor(ctx)
 	freshLocalizeFlow := facade == "explore" && operation == "localize"
 	newUserTask, invalidBoundary := parseLocalizationNewUserBoundary(facade, operation, req.GetArguments())
@@ -659,6 +666,13 @@ func (s *Server) handleFacade(ctx context.Context, facade string, req mcpgo.Call
 		localizationReadReservation = reservation
 		if reservation != 0 {
 			ctx = withLocalizationPermittedEvidenceCapture(ctx, reservation)
+		}
+	}
+	// A finite localization allowance or task boundary is session control, not
+	// replayable answer assembly. It is finalized before the outer exact gate.
+	if transactionalBoundaryFlow || localizationReadReservation != 0 {
+		if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+			state.replayUnsafe = true
 		}
 	}
 	result, err := s.invokeFacadeSpec(ctx, req, spec)
@@ -1155,16 +1169,28 @@ func (s *Server) invokeFacadeSpec(ctx context.Context, req mcpgo.CallToolRequest
 	forwarded.Params.Name = spec.Legacy
 	forwarded.Params.Arguments = normalized
 	forwarded.Params.RawArguments = nil
+	if refusal := s.awaitWatchedFreshness(ctx, spec.Legacy, forwarded, takeRequestFreshness(&forwarded)); refusal != nil {
+		return refusal, nil
+	}
+	ctx = withProjectedReadToolFacts(ctx, spec.Legacy)
+	ctx = s.captureToolFreshness(ctx)
+	ctx, forwarded = s.reserveToolFreshnessBudget(ctx, spec.Legacy, forwarded)
 	result, err = legacy.handler(ctx, forwarded)
 	if err == nil {
 		// Book the retrieval half of the savings ledger under the LEGACY tool
 		// name, so a facade call and a direct legacy call land in the same
 		// per-tool bucket. Runs before decoration: the baseline is what the
 		// handler actually retrieved, not the riders bolted on afterwards.
-		s.recordRetrievalSavings(ctx, spec.Legacy, result)
-		result = s.decorateFacadeFreshness(spec.Legacy, forwarded, result)
+		raw := result
+		afterFreshSymbolAcceptance(ctx, func() { s.recordRetrievalSavings(ctx, spec.Legacy, raw) })
+		result = s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, result)
 	}
 	result = decorateFacadeResultIdentity(result, spec)
+	if state, _ := ctx.Value(freshSymbolAttemptKey{}).(*freshSymbolAttempt); state != nil {
+		state.decorate = func(raw *mcpgo.CallToolResult) *mcpgo.CallToolResult {
+			return decorateFacadeResultIdentity(s.decorateFacadeFreshness(ctx, spec.Legacy, forwarded, raw), spec)
+		}
+	}
 	return result, err
 }
 
@@ -1199,7 +1225,7 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 	}
 	seen := make(map[string]bool)
 	candidates := make([]string, 0, 2)
-	for _, node := range eng.FindSymbols(id) {
+	for _, node := range s.sessionNameCandidates(ctx, eng.Reader(), id, eng.Reader().FindNodesByName) {
 		if node == nil || seen[node.ID] || !s.nodeInSessionScope(ctx, node) {
 			continue
 		}
@@ -1221,6 +1247,39 @@ func (s *Server) resolveFacadeSymbolShorthand(ctx context.Context, id string) (s
 		return id, candidates
 	}
 	return resolved, nil
+}
+
+// sessionNameCandidates returns the nodes named name that a bare-name target
+// may resolve to, before the session-scope check, which callers still apply.
+// The every-repository read decodes each tracked repository's same-named
+// symbols only to drop them, so a session bound to one repository paid for
+// all the others. A bound session whose repositories are known reads each of
+// them, plus the unowned bucket every scope admits (synthetic externals),
+// through the selected reader's repository-scoped finder instead. The finder
+// is asked of the reader the caller reads, so an overlay or routed view
+// without one keeps everyRepo, the caller's every-repository read, rather
+// than bypassing its own layers.
+func (s *Server) sessionNameCandidates(ctx context.Context, reader graph.Reader, name string, everyRepo func(string) []*graph.Node) []*graph.Node {
+	finder, ok := contractCoreSelectedReader(reader).(graph.RepoNamesNodeFinder)
+	if !ok {
+		return everyRepo(name)
+	}
+	repos, bound := s.sessionWorkspaceRepoSet(ctx)
+	if !bound || len(repos) == 0 {
+		return everyRepo(name)
+	}
+	prefixes := []string{""}
+	for repo, allowed := range repos {
+		if allowed && repo != "" {
+			prefixes = append(prefixes, repo)
+		}
+	}
+	sort.Strings(prefixes)
+	var nodes []*graph.Node
+	for _, prefix := range prefixes {
+		nodes = append(nodes, finder.FindNodesByNamesInRepo([]string{name}, prefix)[name]...)
+	}
+	return nodes
 }
 
 // requestedAnalyzeKind applies the same argument-container precedence as the
@@ -1430,14 +1489,12 @@ func blockedAnalyzeKindResult(kind string) *mcpgo.CallToolResult {
 // The outer facade middleware only sees compact names/targets (read,
 // relations, target.file, ...), so applying the policy there would miss the
 // legacy path/id fields the rider is deliberately keyed to.
-func (s *Server) decorateFacadeFreshness(legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
-	if rider := s.freshnessRiderFor(legacy, req); rider != nil {
-		return decorateResultWithFreshness(result, rider)
+func (s *Server) decorateFacadeFreshness(ctx context.Context, legacy string, req mcpgo.CallToolRequest, result *mcpgo.CallToolResult) *mcpgo.CallToolResult {
+	checked, err := s.decorateToolFreshnessChecked(ctx, legacy, req, result)
+	if err != nil {
+		return s.metadataReadError(ctx, req, err)
 	}
-	if isFreshnessListTool(legacy) {
-		return s.decorateListResultWithFreshness(result)
-	}
-	return result
+	return checked
 }
 
 func facadeLegacyManagesOwnOverlay(name string) bool {
@@ -2680,9 +2737,10 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 				}
 			}
 			required := legacy.tool.InputSchema.Required
+			sessionSubscription := spec.Facade == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe")
 			if spec.Facade == "analyze" || (spec.Facade == "workspace_admin" && spec.Legacy == "analyze") {
 				inputSchema, properties, required = analyzeFacadeCapabilitySchema(spec, properties, required)
-			} else if spec.Facade == "session" && (spec.Operation == "subscribe" || spec.Operation == "unsubscribe") {
+			} else if sessionSubscription {
 				inputSchema = map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -2695,7 +2753,7 @@ func (s *Server) facadeCapability(spec facadeOperationSpec, includeSchema bool) 
 				required = []string{"channel"}
 			}
 			requestShape := facadeRequestShape(spec, properties, required)
-			if spec.Facade != "analyze" && spec.Facade != "session" && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
+			if spec.Facade != "analyze" && !sessionSubscription && (spec.Facade != "workspace_admin" || spec.Legacy != "analyze") {
 				inputSchema = facadePublicCapabilitySchema(spec, properties, required, requestShape)
 			}
 			schema, ok := inputSchema.(map[string]any)

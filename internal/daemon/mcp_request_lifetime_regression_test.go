@@ -389,7 +389,7 @@ func TestMCPDispatchLimitConfiguration(t *testing.T) {
 	}
 }
 
-func TestServeMCPDispatcherSaturationFailsFastAndKeepsReaderResponsive(t *testing.T) {
+func TestServeMCPDispatcherSaturationWithQueueDisabledFailsFastAndKeepsReaderResponsive(t *testing.T) {
 	filled := 0
 	for {
 		select {
@@ -407,10 +407,11 @@ saturated:
 		}
 	}()
 	var dispatches atomic.Int32
-	conn, reader, done := startMCPConnectionTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
+	var zero time.Duration
+	conn, reader, done := startMCPConnectionWithHooksTest(t, time.Second, func(context.Context, []byte) ([]byte, error) {
 		dispatches.Add(1)
 		return nil, errors.New("saturated dispatcher unexpectedly ran")
-	})
+	}, &mcpConnectionHooks{dispatchQueueWait: &zero})
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"edit"}}`)
 	writeMCPTestFrame(t, conn, `{"jsonrpc":"2.0","id":2,"method":"ping"}`)
 	responses := map[string]testMCPResponse{}
@@ -422,6 +423,15 @@ saturated:
 		response := responses[id]
 		if response.Error == nil || response.Error.Code != -32002 || response.Error.Data["outcome"] != "server_busy" {
 			t.Fatalf("busy response %s = %#v", id, response)
+		}
+		// Lane admission supplies bounded retry guidance even with queueing off;
+		// this remains a not-started refusal and does not relax lifetime safety.
+		retry, ok := response.Error.Data["retry_after_ms"].(float64)
+		if !ok || retry < 100 || retry > 5000 {
+			t.Fatalf("busy response %s retry=%#v", id, response.Error.Data["retry_after_ms"])
+		}
+		if waited, ok := response.Error.Data["queue_wait_ms"].(float64); !ok || waited != 0 {
+			t.Fatalf("queue-off response %s wait=%#v", id, response.Error.Data["queue_wait_ms"])
 		}
 	}
 	if responses["1"].Error.Data["delivery_unknown"] != false || responses["1"].Error.Data["retryable"] != true {
